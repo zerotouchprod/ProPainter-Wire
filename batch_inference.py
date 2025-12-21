@@ -81,7 +81,7 @@ def run_job(job_id: str, source_url: str, progress_callback=None) -> dict:
     # ------------------- Load models -------------------
     if progress_callback: progress_callback(f"Loading AI Models... (0/{total_files})")
     device = get_device()
-    models = load_models(device, use_half=True)
+    models = load_models(device, use_half=False)
 
     # ------------------- Process Loop -------------------
     processed_count = 0
@@ -142,7 +142,7 @@ def run_job(job_id: str, source_url: str, progress_callback=None) -> dict:
                 ref_stride=10,
                 mask_dilation=0,    
                 neighbor_length=10,
-                fp16=True,
+                fp16=False,
                 save_masked_in=True,
                 models=models,
                 device=device

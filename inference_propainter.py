@@ -174,17 +174,6 @@ class StreamingCompositor:
     def finish(self):
         self.flush(float('inf'))
 
-def copy_metadata(source_path, target_path):
-    temp_path = target_path + "_temp.mov"
-    cmd = [
-        'ffmpeg', '-y', '-i', target_path, '-i', source_path,
-        '-map', '0:v', '-map_metadata', '1', '-map_metadata:s:v', '1:s:v',
-        '-c', 'copy', '-movflags', 'use_metadata_tags', temp_path
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if os.path.exists(temp_path):
-        os.replace(temp_path, target_path)
-
 # --- Processing Helpers ---
 
 def pad_frames_to_div8(frames, mask_frames=None):
@@ -491,10 +480,7 @@ def run_inference(video, mask, output='results', resize_ratio=1.0, height=-1, wi
     compositor.finish()
     writer.close()
     
-    final_vid_path = os.path.join(output, result_filename)
-    if os.path.isfile(video):
-        copy_metadata(video, final_vid_path)
-        
+    final_vid_path = os.path.join(output, result_filename)        
     print(f'\nAll results are saved in {output}')
 
 if __name__ == '__main__':

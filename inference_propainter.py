@@ -34,8 +34,9 @@ range_names = {0: 'tv', 1: 'tv', 2: 'pc'}
 
 # --- Sync Frame Writer (High Quality Output) ---
 class SyncFrameWriter:
-    def __init__(self, output_path, fps, color_info):
+    def __init__(self, output_path, filename, fps, color_info):
         self.output_path = output_path
+        self.filename = filename
         self.fps = fps
         self.color_info = color_info
         self.proc = None
@@ -43,13 +44,14 @@ class SyncFrameWriter:
 
     def _init_ffmpeg(self, w, h):
         # High-Quality ProRes 4444 XQ settings
+        out_file = os.path.join(self.output_path, self.filename)
         cmd = [
             'ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb48le',
             '-s', f'{w}x{h}', '-r', str(self.fps), '-i', '-',
             '-c:v', 'prores_ks', '-profile:v', '5', '-pix_fmt', 'yuv444p12le',
             '-vendor', 'apl0', '-bits_per_mb', '8000', '-quant_mat', 'hq',
             '-bitexact', '-movflags', '+write_colr+faststart',
-            os.path.join(self.output_path, 'inpaint_out.mov')
+            out_file
         ]
         
         c = self.color_info
@@ -76,13 +78,13 @@ class SyncFrameWriter:
             self.proc.wait()
 
 # --- MASK PREVIEW STREAMER (High Quality MP4) ---
-def save_masked_preview_stream(frames, masks_pil, output_dir, fps):
+def save_masked_preview_stream(frames, masks_pil, output_dir, filename, fps):
     """
     Streams frames through FFmpeg to create a Full-Res mp4 with green mask overlay.
     """
     if not frames or not masks_pil: return
 
-    output_path = os.path.join(output_dir, 'masked_in.mp4')
+    output_path = os.path.join(output_dir, filename)
     h, w = frames[0].shape[:2]
     
     # UPDATED SETTINGS:
@@ -98,7 +100,7 @@ def save_masked_preview_stream(frames, masks_pil, output_dir, fps):
     
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
     
-    print("Generating Masked Preview (Streaming High-Res)...")
+    print(f"Generating Masked Preview: {filename}...")
     try:
         for i, frame_16bit in enumerate(frames):
             # 1. Convert 16-bit source to 8-bit for preview
@@ -211,7 +213,7 @@ def read_frame_from_videos(frame_root):
     video_name = os.path.basename(frame_root)
 
     if frame_root.endswith(('mp4', 'mov', 'avi', 'mkv')):
-        video_name = video_name[:-4]
+        video_name = os.path.splitext(video_name)[0]
         container = av.open(frame_root)
         video_stream = container.streams.video[0]
         
@@ -362,6 +364,10 @@ def run_inference(video, mask, output='results', resize_ratio=1.0, height=-1, wi
     frames, fps, size, video_name, color_info = read_frame_from_videos(video)
     original_w, original_h = size
     fps = save_fps if fps is None else fps
+    
+    # Define output names based on input video name
+    result_filename = f"{video_name}_result.mov"
+    preview_filename = f"{video_name}_mask_preview.mp4"
 
     # 2. Pad
     if mode == 'video_inpainting':
@@ -373,7 +379,7 @@ def run_inference(video, mask, output='results', resize_ratio=1.0, height=-1, wi
         # --- STREAM SAVE MASKED INPUT (LOW RAM) ---
         if save_masked_in:
             if not os.path.exists(output): os.makedirs(output, exist_ok=True)
-            save_masked_preview_stream(frames, frames_pil_masks, output, fps)
+            save_masked_preview_stream(frames, frames_pil_masks, output, preview_filename, fps)
         # -----------------------------------------------------
 
         flow_masks_tensor = torch.stack([torch.from_numpy(np.array(m)).float() / 255.0 for m in frames_pil_masks]).unsqueeze(1)
@@ -438,7 +444,8 @@ def run_inference(video, mask, output='results', resize_ratio=1.0, height=-1, wi
     # --- COMPOSITION & SYNC SAVING ---
     if not os.path.exists(output): os.makedirs(output, exist_ok=True)
     
-    writer = SyncFrameWriter(output, fps, color_info)
+    # Pass the result_filename here
+    writer = SyncFrameWriter(output, result_filename, fps, color_info)
     compositor = StreamingCompositor(writer, original_w, original_h, fps)
 
     neighbor_stride = neighbor_length // 2
@@ -484,7 +491,7 @@ def run_inference(video, mask, output='results', resize_ratio=1.0, height=-1, wi
     compositor.finish()
     writer.close()
     
-    final_vid_path = os.path.join(output, 'inpaint_out.mov')
+    final_vid_path = os.path.join(output, result_filename)
     if os.path.isfile(video):
         copy_metadata(video, final_vid_path)
         

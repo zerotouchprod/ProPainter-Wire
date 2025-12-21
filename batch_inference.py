@@ -101,9 +101,8 @@ def run_job(job_id: str, source_url: str, progress_callback=None) -> dict:
              if os.path.exists(mask_path_alt):
                  mask_path = mask_path_alt
 
-        final_out = os.path.join(LOCAL_OUTPUT_DIR, f"{basename}_result{ext}")
-        # Define output path for the mask preview
-        final_mask_preview = os.path.join(LOCAL_OUTPUT_DIR, f"{basename}_mask_preview.mp4")
+        # Prediction of result file name based on new inference script logic
+        expected_out = os.path.join(LOCAL_OUTPUT_DIR, f"{basename}_result.mov")
 
         # --- PROGRESS UPDATE ---
         msg = f"Processing: {file} ({processed_count + 1}/{total_files})"
@@ -112,7 +111,7 @@ def run_job(job_id: str, source_url: str, progress_callback=None) -> dict:
 
         try:
             # 1. Validation Checks
-            if os.path.exists(final_out):
+            if os.path.exists(expected_out):
                 print(f"Skipping {file} — result exists")
                 processed_count += 1
                 continue 
@@ -133,6 +132,7 @@ def run_job(job_id: str, source_url: str, progress_callback=None) -> dict:
             except: pass
 
             # 3. Inference 
+            # Note: The inference script now handles renaming internally to {basename}_result.mov
             run_inference(
                 video=video_path,
                 mask=mask_path, 
@@ -143,24 +143,11 @@ def run_job(job_id: str, source_url: str, progress_callback=None) -> dict:
                 mask_dilation=0,    
                 neighbor_length=10,
                 fp16=True,
-                save_masked_in=True, # Ensure this is ON
+                save_masked_in=True,
                 models=models,
                 device=device
             )
 
-            # 4. Rename results
-            # The inference script outputs 'inpaint_out.mov' and 'masked_in.mp4'
-            # We must move them immediately to avoid overwriting in the next loop iteration
-            
-            temp_result = os.path.join(LOCAL_OUTPUT_DIR, "inpaint_out.mov")
-            temp_mask_preview = os.path.join(LOCAL_OUTPUT_DIR, "masked_in.mp4")
-
-            if os.path.exists(temp_result):
-                shutil.move(temp_result, final_out)
-            
-            if os.path.exists(temp_mask_preview):
-                shutil.move(temp_mask_preview, final_mask_preview)
-            
             processed_count += 1
             
             # --- CRITICAL: VRAM CLEANUP ---
@@ -173,12 +160,6 @@ def run_job(job_id: str, source_url: str, progress_callback=None) -> dict:
             print(f"❌ Error processing {file}: {error_msg}")
             failed_files.append({"file": file, "error": error_msg})
             
-            # Clean up potential partial files
-            if os.path.exists(os.path.join(LOCAL_OUTPUT_DIR, "inpaint_out.mov")):
-                os.remove(os.path.join(LOCAL_OUTPUT_DIR, "inpaint_out.mov"))
-            if os.path.exists(os.path.join(LOCAL_OUTPUT_DIR, "masked_in.mp4")):
-                os.remove(os.path.join(LOCAL_OUTPUT_DIR, "masked_in.mp4"))
-                
             # Try to reset memory even on failure
             gc.collect()
             torch.cuda.empty_cache()
@@ -191,7 +172,7 @@ def run_job(job_id: str, source_url: str, progress_callback=None) -> dict:
 
     if progress_callback: progress_callback("Zipping results...")
     
-    # Improved Zipping: Store relative paths correctly to avoid junk folders
+    # Store relative paths correctly to avoid junk folders
     with zipfile.ZipFile(LOCAL_ZIP_PATH, 'w', compression=zipfile.ZIP_DEFLATED) as z:
         for root, _, files in os.walk(LOCAL_OUTPUT_DIR):
             for f in files:
@@ -220,15 +201,6 @@ def run_job(job_id: str, source_url: str, progress_callback=None) -> dict:
          for i, p in enumerate(parts):
              if 'http' in p: url = p
              if len(p) == 4 and i > 0 and parts[i-1] == '密码:': pwd = p
-
-    # ------------------- FINAL CLEANUP -------------------
-    if progress_callback: progress_callback("Cleaning up workspace...")
-    try:
-        if os.path.exists(LOCAL_INPUT_DIR): shutil.rmtree(LOCAL_INPUT_DIR)
-        if os.path.exists(LOCAL_OUTPUT_DIR): shutil.rmtree(LOCAL_OUTPUT_DIR)
-        if os.path.exists(LOCAL_ZIP_PATH): os.remove(LOCAL_ZIP_PATH)
-    except Exception as e:
-        print(f"Cleanup warning: {e}")
 
     return {
         "url": f"{url}?pwd={pwd}",

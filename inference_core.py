@@ -1,30 +1,22 @@
-import sys
-import types
-import warnings
-
-# --- 1. PRE-EMPTIVE MONKEY PATCH ---
-# Prevent RAFT from loading broken CUDA kernels even if we use CPU (just to be safe)
-dummy = types.ModuleType('alt_cuda_corr')
-dummy.CorrelationFunction = None
-sys.modules['alt_cuda_corr'] = dummy
-sys.modules['model.modules.RAFT.core.alt_cuda_corr'] = dummy
-# -----------------------------------
-
 import os
+import sys
 import cv2
 import torch
 import argparse
 import numpy as np
+import warnings
 import torch.nn.functional as F
 
-# Add repo root
+# Disable Warnings
+warnings.filterwarnings("ignore")
+
+# Add Path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# Import Models
 from model.propainter import InpaintGenerator
 from model.modules.flow_comp_raft import RAFT_bi
 from model.recurrent_flow_completion import RecurrentFlowCompleteNet
-
-warnings.filterwarnings("ignore")
 
 
 def imread(img_path):
@@ -41,48 +33,39 @@ def pad_img_to_modulo(img, mod):
 
 
 def main(args):
-    print(f"🚀 [Core] Starting ProPainter (Hybrid Mode: RAFT@CPU + Model@GPU)...")
+    print("🚀 [Core] Starting ProPainter (CPU-Safe Mode)...")
 
-    # Devices
-    gpu_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cpu_dev = torch.device("cpu")
+    # Force RAFT to CPU to avoid ANY CUDA kernel issues
+    raft_device = torch.device("cpu")
+    gpu_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Paths
     base = os.path.dirname(os.path.abspath(__file__))
     raft_p = args.raft_model_path or os.path.join(base, 'weights', 'raft-things.pth')
     fc_p = args.fc_model_path or os.path.join(base, 'weights', 'recurrent_flow_completion.pth')
     pp_p = args.model_path
 
     print("📦 Loading models...")
+    # RAFT on CPU
+    fix_raft = RAFT_bi(model_path=raft_p, device=raft_device)
+    # Others on GPU
+    fix_fc = RecurrentFlowCompleteNet(fc_p).to(gpu_device).eval()
+    model = InpaintGenerator(model_path=pp_p).to(gpu_device).eval()
 
-    # 1. RAFT -> CPU (Avoids CUDA Crashes)
-    print(f"   - Loading RAFT on CPU to ensure stability...")
-    fix_raft = RAFT_bi(model_path=raft_p, device=cpu_dev)
-
-    # 2. Flow Completion -> GPU
-    fix_fc = RecurrentFlowCompleteNet(fc_p).to(gpu_dev).eval()
-
-    # 3. ProPainter -> GPU
-    model = InpaintGenerator(model_path=pp_p).to(gpu_dev).eval()
-
-    # FP16 (Only for ProPainter)
     use_half = False
     if torch.cuda.is_available():
         try:
             model = model.half()
             use_half = True
-            print("✅ ProPainter: FP16 Enabled")
+            print("✅ FP16 Enabled (Model)")
         except:
             model = model.float()
 
-    # Data Loading
     frames = sorted(
         [os.path.join(args.video, f) for f in os.listdir(args.video) if f.endswith(('.jpg', '.png', '.jpeg'))])
     masks = sorted([os.path.join(args.mask, f) for f in os.listdir(args.mask) if f.endswith(('.jpg', '.png', '.jpeg'))])
-    if not frames: raise ValueError("No frames found")
+    if not frames: raise ValueError("No frames")
 
     print(f"🔄 Processing {len(frames)} frames...")
-
     video_data, mask_data = [], []
     for f, m in zip(frames, masks):
         img = pad_img_to_modulo(imread(f), 16)
@@ -90,57 +73,43 @@ def main(args):
         video_data.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
         mask_data.append((torch.from_numpy(msk).float() / 255.0 > 0.5).float().unsqueeze(0))
 
-    # Master tensors on GPU
-    masked_frames_gpu = torch.stack(video_data).unsqueeze(0).to(gpu_dev)
-    masks_gpu = torch.stack(mask_data).unsqueeze(0).to(gpu_dev)
+    # Tensors
+    masked_frames_gpu = torch.stack(video_data).unsqueeze(0).to(gpu_device)
+    masks_gpu = torch.stack(mask_data).unsqueeze(0).to(gpu_device)
 
-    # --- RAFT ON CPU ---
+    # --- RAFT (CPU Execution) ---
     print("🌊 Running RAFT (on CPU)...")
-
-    # Prepare CPU inputs
-    # Downscale to speed up CPU inference (0.5x)
     scale = 0.5
     b, t, c, h, w = masked_frames_gpu.shape
     h_s, w_s = int(h * scale), int(w * scale)
 
-    # Downscale on GPU first (fast), then move to CPU
+    # Downscale on GPU, move to CPU
     vid_s_gpu = F.interpolate(masked_frames_gpu.view(-1, c, h, w), size=(h_s, w_s), mode='bilinear',
                               align_corners=False)
     vid_s_cpu = vid_s_gpu.view(b, t, c, h_s, w_s).cpu()
 
     with torch.no_grad():
-        # RUN RAFT ON CPU
-        # fix_raft expects input on its device (cpu)
         flows_s_cpu = fix_raft(vid_s_cpu, None)
 
-    # Move results back to GPU and Upscale
-    print("🌊 RAFT Done. Moving flows to GPU...")
+    # Move to GPU & Upscale
+    print("🌊 RAFT Done. Moving to GPU...")
     flows_l = []
     for f in flows_s_cpu:
-        # f is [B, T-1, 2, H, W] on CPU
-        f_gpu = f.to(gpu_dev)
-
-        # Upscale on GPU
+        f_gpu = f.to(gpu_device)
         up = F.interpolate(f_gpu.view(-1, 2, h_s, w_s), size=(h, w), mode='bilinear', align_corners=False)
         flows_l.append(up.view(b, t - 1, 2, h, w) * (1.0 / scale))
-
     gt_flows = tuple(flows_l)
 
-    # Cleanup
-    del vid_s_cpu, flows_s_cpu, vid_s_gpu
+    del vid_s_cpu, flows_s_cpu
     torch.cuda.empty_cache()
 
-    # --- INFERENCE ON GPU ---
-    print("⚡ ProPainter Inference...")
+    # --- INFERENCE ---
+    print("⚡ Inference...")
     with torch.no_grad():
-        # Flow Completion
         updated_flows = fix_fc(gt_flows[0], gt_flows[1], masks_gpu)
-
-        # ProPainter
         in_v = masked_frames_gpu.half() if use_half else masked_frames_gpu
         in_m = masks_gpu.half() if use_half else masks_gpu
         in_f = (updated_flows[0].half(), updated_flows[1].half()) if use_half else updated_flows
-
         pred = model(in_v, in_f, in_m)[0]
 
     # Save
@@ -157,7 +126,6 @@ def main(args):
         orig = imread(frame).astype(float) / 255.0
         m = (cv2.imread(masks[i], 0).astype(float) / 255.0 > 0.5)[:, :, None]
         final = p * m + orig * (1 - m)
-
         cv2.imwrite(os.path.join(args.output, os.path.basename(frame)),
                     cv2.cvtColor((final * 255).astype(np.uint8), cv2.COLOR_RGB2BGR))
 

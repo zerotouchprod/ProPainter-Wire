@@ -111,7 +111,7 @@ def process_single_chunk(video_tensor, mask_tensor, model, raft_model,
     b, t, c, h, w = video_tensor.shape
     
     # Enable AMP for this chunk
-    use_amp = torch.cuda.is_available()
+    use_amp = torch.cuda.is_available() and args.fp16
     dtype = torch.float16 if use_amp else torch.float32
     
     with torch.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', 
@@ -407,5 +407,9 @@ if __name__ == '__main__':
     parser.add_argument('--neighbor_length', type=int, default=20, help='Neighbor window length')
     parser.add_argument('--chunk_size', type=int, default=10, 
                        help='Number of frames to process at once (for memory optimization)')
+    parser.add_argument('--fp16', action='store_true', default=True,
+                       help='Use Automatic Mixed Precision (AMP) for faster inference (default: True)')
+    parser.add_argument('--no-fp16', dest='fp16', action='store_false',
+                       help='Disable Automatic Mixed Precision (AMP)')
     args = parser.parse_args()
     main(args)

@@ -11,12 +11,12 @@ from PIL import Image
 # --- CONFIG ---
 MAX_WIDTH = 1280  # Защита от OOM
 MIN_FRAMES = 12  # ЖЕСТКИЙ СТАНДАРТ: Всегда добиваем до 12 кадров
-LOCAL_FRAMES = 5  # Стандартное окно (безопасно для длины 12)
+LOCAL_FRAMES = 12  # Используем все кадры как локальные (после padding)
 
 # --- SETUP ---
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 warnings.filterwarnings("ignore")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -117,7 +117,7 @@ def run_pipeline(args):
     if not f_files: raise ValueError("No frames found")
 
     # Model
-    model = InpaintGenerator(model_path=args.model_path).to(device).half().eval()
+    model = InpaintGenerator(model_path=args.model_path).to(device).float().eval()
 
     # Dimensions
     ref_img = smart_imread(f_files[0])
@@ -148,7 +148,7 @@ def run_pipeline(args):
         msk = smart_imread(m_p, True)
         if msk is None: msk = generate_fallback_mask(target_h, target_w)
         if msk.shape[:2] != (target_h, target_w):
-            msk = cv2.resize(msk, (target_w, target_w), interpolation=cv2.INTER_NEAREST)
+            msk = cv2.resize(msk, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
         msk_pad = pad_img_to_modulo((msk > 127).astype(np.uint8) * 255, 16)
         mask_list.append((torch.from_numpy(msk_pad).float() / 255.0 > 0.5).float().unsqueeze(0))
 
@@ -163,23 +163,14 @@ def run_pipeline(args):
 
     # Convert to Raw Flow
     raw_flow = [(t.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8) for t in video_list]
-    frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).half()
-    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).half()
-
-    # DEBUG
-    print(f"[DEBUG] frames_gpu shape: {frames_gpu.shape}")
-    print(f"[DEBUG] masks_gpu shape: {masks_gpu.shape}")
+    frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).float()
+    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).float()
 
     # Flow
     log(f"Computing flow for {len(video_list)} frames...")
     fwd_cpu, bwd_cpu = compute_flow_opencv(raw_flow)
-    fwd_gpu = fwd_cpu.to(device).half()
-    bwd_gpu = bwd_cpu.to(device).half()
-
-    # DEBUG
-    print(f"[DEBUG] fwd_gpu shape: {fwd_gpu.shape}")
-    print(f"[DEBUG] bwd_gpu shape: {bwd_gpu.shape}")
-    print(f"[DEBUG] LOCAL_FRAMES: {LOCAL_FRAMES}")
+    fwd_gpu = fwd_cpu.to(device).float()
+    bwd_gpu = bwd_cpu.to(device).float()
 
     # Inference
     log(f"Inference with LOCAL_FRAMES={LOCAL_FRAMES}...")
@@ -187,18 +178,10 @@ def run_pipeline(args):
     with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
         with torch.no_grad():
             # (frames, flows, masks, masks_updated, num_local_frames)
-            print(f"[DEBUG] Calling model with shapes:")
-            print(f"  frames_gpu: {frames_gpu.shape}")
-            print(f"  fwd_gpu: {fwd_gpu.shape}")
-            print(f"  bwd_gpu: {bwd_gpu.shape}")
-            print(f"  masks_gpu: {masks_gpu.shape}")
-            try:
-                pred = model(frames_gpu, (fwd_gpu, bwd_gpu), masks_gpu, masks_gpu, LOCAL_FRAMES)[0]
-            except Exception as e:
-                import traceback
-                print(f"[DEBUG] Exception during model call:")
-                traceback.print_exc()
-                raise
+            # Trim flows to LOCAL_FRAMES-1 (model expects flows for local frames only)
+            fwd_trim = fwd_gpu[:, :LOCAL_FRAMES-1]
+            bwd_trim = bwd_gpu[:, :LOCAL_FRAMES-1]
+            pred = model(frames_gpu, (fwd_trim, bwd_trim), masks_gpu, masks_gpu, LOCAL_FRAMES)[0]
 
     # Save
     log(f"Saving...")

@@ -1,7 +1,0 @@
-{
-  "input": {
-    "input_video": "/runpod-volume/inputs/object_removal/bmx-trees",
-    "mask_video": "/runpod-volume/inputs/object_removal/bmx-trees_mask",
-    "mask_dilation": 5
-  }
-}

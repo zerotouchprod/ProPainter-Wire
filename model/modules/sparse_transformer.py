@@ -247,10 +247,11 @@ class SparseWindowAttention(nn.Module):
                     win_k_t = win_k_t.view(n_wh*n_ww, self.n_head, t*w_h*w_w, c_head)
                     win_v_t = win_v_t.view(n_wh*n_ww, self.n_head, t*w_h*w_w, c_head)
 
-                att_t = (win_q_t @ win_k_t.transpose(-2, -1)) * (1.0 / math.sqrt(win_q_t.size(-1)))
+                # SAFE MATMUL: Force FP32 + Clone to prevent CUDA CUBLAS errors on modern GPUs
+                att_t = torch.matmul(win_q_t.float(), win_k_t.float().transpose(-2, -1).clone()) * (1.0 / math.sqrt(win_q_t.size(-1)))
                 att_t = F.softmax(att_t, dim=-1)
                 att_t = self.attn_drop(att_t)
-                y_t = att_t @ win_v_t 
+                y_t = torch.matmul(att_t.float(), win_v_t.float().clone())
                 
                 out[i, mask_ind_i] = y_t.view(-1, self.n_head, t, w_h*w_w, c_head)
 
@@ -262,10 +263,11 @@ class SparseWindowAttention(nn.Module):
             win_k_s = win_k[i, unmask_ind_i, :, :, :w_h*w_w]
             win_v_s = win_v[i, unmask_ind_i, :, :, :w_h*w_w]
 
-            att_s = (win_q_s @ win_k_s.transpose(-2, -1)) * (1.0 / math.sqrt(win_q_s.size(-1)))
+            # SAFE MATMUL: Force FP32 + Clone to prevent CUDA CUBLAS errors on modern GPUs
+            att_s = torch.matmul(win_q_s.float(), win_k_s.float().transpose(-2, -1).clone()) * (1.0 / math.sqrt(win_q_s.size(-1)))
             att_s = F.softmax(att_s, dim=-1)
             att_s = self.attn_drop(att_s)
-            y_s = att_s @ win_v_s
+            y_s = torch.matmul(att_s.float(), win_v_s.float().clone())
             out[i, unmask_ind_i] = y_s
 
         # re-assemble all head outputs side by side

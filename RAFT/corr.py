@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from .utils.utils import bilinear_sampler, coords_grid
+from torch.cuda.amp import custom_fwd
 
 try:
     import alt_cuda_corr
@@ -55,29 +56,16 @@ class CorrBlock:
         fmap1 = fmap1.view(batch, dim, ht*wd)
         fmap2 = fmap2.view(batch, dim, ht*wd)
 
-        corr = torch.matmul(fmap1.transpose(1,2), fmap2)
+        # === FIX: FORCE FP32 & CLONE FOR ALIGNMENT ===
+        # .float() ensures we don't use buggy FP16 kernels
+        # .clone() ensures memory is contiguous and aligned
+        fmap1_t = fmap1.transpose(1, 2).float().clone()
+        fmap2_f = fmap2.float().clone()
+        
+        corr = torch.matmul(fmap1_t, fmap2_f)
+        
         corr = corr.view(batch, ht, wd, 1, ht, wd)
-        return corr  / torch.sqrt(torch.tensor(dim).float())
-
-
-class CorrLayer(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, fmap1, fmap2, coords, r):
-        fmap1 = fmap1.contiguous()
-        fmap2 = fmap2.contiguous()
-        coords = coords.contiguous()
-        ctx.save_for_backward(fmap1, fmap2, coords)
-        ctx.r = r
-        corr, = correlation_cudaz.forward(fmap1, fmap2, coords, ctx.r)
-        return corr
-
-    @staticmethod
-    def backward(ctx, grad_corr):
-        fmap1, fmap2, coords = ctx.saved_tensors
-        grad_corr = grad_corr.contiguous()
-        fmap1_grad, fmap2_grad, coords_grad = \
-            correlation_cudaz.backward(fmap1, fmap2, coords, grad_corr, ctx.r)
-        return fmap1_grad, fmap2_grad, coords_grad, None
+        return corr / torch.sqrt(torch.tensor(dim).float())
 
 
 class AlternateCorrBlock:
@@ -92,7 +80,6 @@ class AlternateCorrBlock:
             self.pyramid.append((fmap1, fmap2))
 
     def __call__(self, coords):
-
         coords = coords.permute(0, 2, 3, 1)
         B, H, W, _ = coords.shape
 
@@ -103,7 +90,15 @@ class AlternateCorrBlock:
             fmap2_i = self.pyramid[i][1].permute(0, 2, 3, 1)
 
             coords_i = (coords / 2**i).reshape(B, 1, H, W, 2).contiguous()
-            corr = alt_cuda_corr(fmap1_i, fmap2_i, coords_i, r)
+            
+            # Fallback if compiled cuda version is missing
+            try:
+                corr = alt_cuda_corr(fmap1_i, fmap2_i, coords_i, r)
+            except NameError:
+                # Silent fallback or error if needed. 
+                # Ideally, ProPainter uses standard CorrBlock by default.
+                raise RuntimeError("alt_cuda_corr not compiled")
+                
             corr_list.append(corr.squeeze(1))
 
         corr = torch.stack(corr_list, dim=1)

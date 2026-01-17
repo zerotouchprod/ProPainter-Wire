@@ -465,7 +465,11 @@ def get_gaussian_kernel2d(
     sigma_x, sigma_y = sigma
     kernel_x: torch.Tensor = get_gaussian_kernel1d(ksize_x, sigma_x, force_even)
     kernel_y: torch.Tensor = get_gaussian_kernel1d(ksize_y, sigma_y, force_even)
-    kernel_2d: torch.Tensor = torch.matmul(kernel_x.unsqueeze(-1), kernel_y.unsqueeze(-1).t())
+    # SAFE MATMUL: Force FP32 + Clone to prevent CUDA CUBLAS errors on modern GPUs
+    kernel_2d: torch.Tensor = torch.matmul(
+        kernel_x.unsqueeze(-1).float(), 
+        kernel_y.unsqueeze(-1).t().float().clone()
+    )
     return kernel_2d
 
 
@@ -686,5 +690,6 @@ def get_hanning_kernel2d(kernel_size: Tuple[int, int], device=torch.device('cpu'
         raise TypeError(f"ksize must be an tuple of positive integers > 2. Got {kernel_size}")
     ky: torch.Tensor = get_hanning_kernel1d(kernel_size[0], device, dtype)[None].T
     kx: torch.Tensor = get_hanning_kernel1d(kernel_size[1], device, dtype)[None]
-    kernel2d = ky @ kx
+    # SAFE MATMUL: Force FP32 + Clone to prevent CUDA CUBLAS errors on modern GPUs
+    kernel2d = torch.matmul(ky.float(), kx.float().clone())
     return kernel2d

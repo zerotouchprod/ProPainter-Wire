@@ -6,3 +6,4 @@ scipy
 imageio
 tqdm
 einops
+easydict

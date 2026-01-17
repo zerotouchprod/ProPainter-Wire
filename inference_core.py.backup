@@ -117,72 +117,9 @@ def process_single_chunk(video_tensor, mask_tensor, model, raft_model,
     with torch.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', 
                        dtype=dtype, enabled=use_amp):
         
-        # 1. Compute flows with memory-efficient downscale-upscale strategy
+        # 1. Compute flows (keep RAFT in FP32 for stability)
         with torch.no_grad():
-            # Memory Efficient RAFT: Downscale -> Compute -> Upscale
-            import torch.nn.functional as F
-            
-            # Get original dimensions
-            b, t, c, h_orig, w_orig = video_tensor.shape
-            
-            # Calculate optimal scale factor (0.5 reduces memory by ~75%)
-            # Auto-select based on resolution
-            total_pixels = h_orig * w_orig
-            if total_pixels > 1024 * 1024:  # > 1MP
-                scale_factor = 0.5
-                print(f"🌊 Applying smart downscale (0.5x) for RAFT: {h_orig}x{w_orig} -> {int(h_orig*scale_factor)}x{int(w_orig*scale_factor)}")
-            else:
-                scale_factor = 1.0
-            
-            if scale_factor < 1.0:
-                h_small = int(h_orig * scale_factor)
-                w_small = int(w_orig * scale_factor)
-                
-                # Reshape for processing: [B, T, C, H, W] -> [B*T, C, H, W]
-                video_reshaped = video_tensor.view(-1, c, h_orig, w_orig)
-                
-                # Downscale for RAFT computation
-                video_small = F.interpolate(video_reshaped.float(), 
-                                           size=(h_small, w_small), 
-                                           mode='bilinear', 
-                                           align_corners=False)
-                
-                # Reshape back: [B*T, C, H_small, W_small] -> [B, T, C, H_small, W_small]
-                video_small = video_small.view(b, t, c, h_small, w_small)
-                
-                # Run RAFT on downscaled video
-                flows_small = raft_model(video_small, iters=args.raft_iter)
-                
-                # Upscale flows back to original size
-                flows_large = []
-                for flow in flows_small:
-                    # flow shape: [B, T-1, 2, H_small, W_small]
-                    bf, tf, cf, hf, wf = flow.shape
-                    
-                    # Reshape for interpolation: [B*(T-1), 2, H_small, W_small]
-                    flow_flat = flow.view(-1, cf, hf, wf)
-                    
-                    # Upscale flow tensor
-                    upscaled = F.interpolate(flow_flat,
-                                            size=(h_orig, w_orig),
-                                            mode='bilinear',
-                                            align_corners=False)
-                    
-                    # Scale flow values (optical flow scales with image size)
-                    upscaled = upscaled * (1.0 / scale_factor)
-                    
-                    # Reshape back: [B, T-1, 2, H_orig, W_orig]
-                    upscaled = upscaled.view(bf, tf, cf, h_orig, w_orig)
-                    flows_large.append(upscaled)
-                
-                gt_flows_bi = tuple(flows_large)
-                
-                # Clean up to free memory
-                del video_small, flows_small, video_reshaped
-                torch.cuda.empty_cache()
-            else:
-                # Original resolution is fine, use standard approach
-                gt_flows_bi = raft_model(video_tensor.float(), iters=args.raft_iter)
+            gt_flows_bi = raft_model(video_tensor.float(), iters=args.raft_iter)
         
         # 2. Complete flows (FP32 for stability)
         with torch.no_grad():

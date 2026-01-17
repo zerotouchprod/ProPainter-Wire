@@ -5,7 +5,7 @@
       <img src="assets/propainter_logo1_glow.png" style="width: 180px">
    </a>
 </div>
-
+1
 <h1>ProPainter: Improving Propagation and Transformer for Video Inpainting</h1>
 
 <div>

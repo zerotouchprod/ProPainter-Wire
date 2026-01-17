@@ -8,20 +8,20 @@ import warnings
 import re
 from PIL import Image
 
-# STABILITY
+# --- CONFIG ---
+MAX_WIDTH = 1280  # Защита от OOM (12.5GB VRAM)
+MIN_FRAMES = 5  # Минимальная длина чанка для ProPainter
+
+# --- SETUP ENV ---
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-
 warnings.filterwarnings("ignore")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model.propainter import InpaintGenerator
-
-MAX_WIDTH = 1280
-MIN_FRAMES = 5  # Minimum frames required to prevent "stack expects non-empty TensorList"
 
 
 def log(msg):
@@ -29,6 +29,8 @@ def log(msg):
 
 
 def smart_imread(img_path, grayscale=False):
+    """ Robust Image Reader (Symlinks, Index Shift, Fallbacks) """
+
     def try_load(path):
         if not os.path.exists(path): return None
         try:
@@ -42,6 +44,7 @@ def smart_imread(img_path, grayscale=False):
     img = try_load(img_path)
     if img is not None: return img
 
+    # Fallback search
     dir_name = os.path.dirname(img_path)
     file_name = os.path.basename(img_path)
     folder_type = os.path.basename(dir_name)
@@ -69,8 +72,9 @@ def smart_imread(img_path, grayscale=False):
 
 
 def generate_fallback_mask(h, w):
-    log("   Generating synthetic mask")
+    log("   Generating synthetic mask (Fallback)")
     mask = np.zeros((h, w), dtype=np.uint8)
+    # ROI: 0.05, 0.5, 0.9, 0.3
     x, y = int(0.05 * w), int(0.5 * h)
     mw, mh = int(0.9 * w), int(0.3 * h)
     cv2.rectangle(mask, (x, y), (x + mw, y + mh), 255, -1)
@@ -108,149 +112,14 @@ def compute_flow_opencv(frames, downscale_factor=0.5):
 def run_pipeline(args):
     log("Starting...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log(f"Device: {device}")
 
+    # Files
     f_files = sorted(
         [os.path.join(args.video, f) for f in os.listdir(args.video) if f.endswith(('.jpg', '.png', '.jpeg'))])
     m_files = sorted(
         [os.path.join(args.mask, f) for f in os.listdir(args.mask) if f.endswith(('.jpg', '.png', '.jpeg'))])
 
-    log(f"Found {len(f_files)} frames in {args.video}")
     if not f_files: raise ValueError("No frames found")
 
     # Model
-    log("Loading model...")
-    model = InpaintGenerator(model_path=args.model_path).to(device).half().eval()
-    log("Model loaded.")
-
-    # Dims
-    ref_img = smart_imread(f_files[0])
-    if ref_img is None:
-        for f in f_files:
-            ref_img = smart_imread(f)
-            if ref_img is not None: break
-    if ref_img is None: raise ValueError("CRITICAL: No valid frames found")
-
-    orig_h, orig_w = ref_img.shape[:2]
-    log(f"Original Dims: {orig_w}x{orig_h}")
-
-    scale = 1.0
-    if orig_w > MAX_WIDTH: scale = MAX_WIDTH / orig_w
-    target_w = (int(orig_w * scale) // 2) * 2
-    target_h = (int(orig_h * scale) // 2) * 2
-    log(f"Target Dims: {target_w}x{target_h} (Scale {scale})")
-
-    # Load Data
-    log("Loading data into tensors...")
-    video_list, mask_list = [], []
-
-    # We load everything into Lists first
-    for i, (f_p, m_p) in enumerate(zip(f_files, m_files)):
-        img = smart_imread(f_p)
-        if img is None: raise ValueError(f"Missing frame {f_p}")
-        if img.shape[:2] != (target_h, target_w):
-            img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        img_pad = pad_img_to_modulo(img, 16)
-        t_img = torch.from_numpy(img_pad).permute(2, 0, 1).float() / 255.0
-        video_list.append(t_img)
-
-        msk = smart_imread(m_p, True)
-        if msk is None: msk = generate_fallback_mask(target_h, target_w)
-        if msk.shape[:2] != (target_h, target_w):
-            msk = cv2.resize(msk, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-        msk_pad = pad_img_to_modulo((msk > 127).astype(np.uint8) * 255, 16)
-        t_msk = (torch.from_numpy(msk_pad).float() / 255.0 > 0.5).float().unsqueeze(0)
-        mask_list.append(t_msk)
-
-    # TEMPORAL PADDING FIX
-    original_length = len(video_list)
-    if original_length < MIN_FRAMES:
-        pad_needed = MIN_FRAMES - original_length
-        log(f"⚠️ Chunk too short ({original_length} < {MIN_FRAMES}). Padding with {pad_needed} duplicates.")
-        for _ in range(pad_needed):
-            video_list.append(video_list[-1])  # Duplicate last frame
-            mask_list.append(mask_list[-1])  # Duplicate last mask
-
-    # Now create Raw Flow inputs from the (potentially padded) list
-    # We need to convert tensors back to numpy for OpenCV
-    raw_flow = []
-    for t_img in video_list:
-        raw_flow.append((t_img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8))
-
-    log(f"Loaded {len(video_list)} tensors (Original: {original_length}).")
-
-    frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).half()
-    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).half()
-    log(f"GPU Frames Shape: {frames_gpu.shape}")
-
-    # Flow
-    log("Computing flow...")
-    fwd_cpu, bwd_cpu = compute_flow_opencv(raw_flow)
-    fwd_gpu = fwd_cpu.to(device).half()
-    bwd_gpu = bwd_cpu.to(device).half()
-    log(f"Flow computed. Shape: {fwd_gpu.shape}")
-
-    # Inference
-    log("Running Model Inference...")
-    torch.cuda.empty_cache()
-    with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
-        with torch.no_grad():
-            # Pass 2 for local_frames (safe default) instead of 0
-            pred = model(frames_gpu, (fwd_gpu, bwd_gpu), masks_gpu, masks_gpu, 2)[0]
-
-    log(f"Inference done. Output shape: {pred.shape}")
-
-    # Save
-    log(f"Saving to {args.output}...")
-    os.makedirs(args.output, exist_ok=True)
-
-    # Only save up to original_length (discard padding)
-    saved_count = 0
-    for i in range(original_length):
-        f_path = f_files[i]
-
-        # Result
-        p = pred[i].permute(1, 2, 0).float().cpu().numpy().clip(0, 1)
-        p = p[:target_h, :target_w, :]  # Crop padding
-        if (target_h, target_w) != (orig_h, orig_w):
-            p = cv2.resize(p, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
-
-        # Composition
-        orig = smart_imread(f_path).astype(float) / 255.0
-        m = smart_imread(m_files[i], True)
-        if m is None: m = generate_fallback_mask(orig_h, orig_w)
-        m = (m.astype(float) / 255.0 > 0.5)[:, :, None]
-
-        if orig.shape[:2] != (orig_h, orig_w): orig = cv2.resize(orig, (orig_w, orig_h))
-        if m.shape[:2] != (orig_h, orig_w): m = cv2.resize(m, (orig_w, orig_h))[:, :, None]
-
-        final = p * m + orig * (1 - m)
-
-        target_filename = os.path.basename(f_files[i])
-        out_path = os.path.join(args.output, target_filename)
-
-        Image.fromarray((final * 255).astype(np.uint8)).save(out_path)
-        saved_count += 1
-
-    log(f"✅ Done. Saved {saved_count} files.")
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--video', type=str, required=True)
-    parser.add_argument('--mask', type=str, required=True)
-    parser.add_argument('--output', type=str, required=True)
-    parser.add_argument('--model_path', type=str, default='weights/ProPainter.pth')
-    parser.add_argument('--raft_model_path', type=str, default=None)
-    parser.add_argument('--fc_model_path', type=str, default=None)
-    parser.add_argument('--raft_iter', type=int, default=20)
-    args = parser.parse_args()
-
-    try:
-        run_pipeline(args)
-    except Exception as e:
-        print(f"\n❌ FATAL: {e}", flush=True)
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
+    model = Inpaint

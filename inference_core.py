@@ -175,7 +175,7 @@ def run_pipeline(args):
     # Inference
     log(f"Inference with LOCAL_FRAMES={LOCAL_FRAMES}...")
     torch.cuda.empty_cache()
-    with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
+    with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
         with torch.no_grad():
             # (frames, flows, masks, masks_updated, num_local_frames)
             # Trim flows to LOCAL_FRAMES-1 (model expects flows for local frames only)

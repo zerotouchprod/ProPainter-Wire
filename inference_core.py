@@ -56,10 +56,10 @@ def main(args):
     fix_flow_complete.eval()
     
     # 3. Load ProPainter Model - Enable FP16 with safety patches
-    print(f"📦 Loading ProPainter from {args.propainter_model_path}...")
-    if not os.path.exists(args.propainter_model_path):
-        raise FileNotFoundError(f"ProPainter weights not found at {args.propainter_model_path}")
-    model = InpaintGenerator(model_path=args.propainter_model_path).to(device)
+    print(f"📦 Loading ProPainter from {args.model_path}...")
+    if not os.path.exists(args.model_path):
+        raise FileNotFoundError(f"ProPainter weights not found at {args.model_path}")
+    model = InpaintGenerator(model_path=args.model_path).to(device)
     model.eval()
     
     # Enable FP16 for ProPainter (memory efficient)
@@ -235,7 +235,7 @@ if __name__ == '__main__':
     parser.add_argument('--video', type=str, required=True, help='Path to input frames folder')
     parser.add_argument('--mask', type=str, required=True, help='Path to input masks folder')
     parser.add_argument('--output', type=str, required=True, help='Path to output folder')
-    parser.add_argument('--propainter_model_path', type=str, default='weights/ProPainter.pth', help='Path to ProPainter .pth model')
+    parser.add_argument('--model_path', type=str, default='weights/ProPainter.pth', help='Path to ProPainter .pth model')
     parser.add_argument('--raft_model_path', type=str, default='weights/raft-things.pth', help='Path to RAFT .pth model')
     parser.add_argument('--fc_model_path', type=str, default='weights/recurrent_flow_completion.pth', help='Path to flow completion .pth model')
     parser.add_argument('--raft_iter', type=int, default=20, help='RAFT iterations')

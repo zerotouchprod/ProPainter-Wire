@@ -9,7 +9,7 @@ import re
 from PIL import Image
 
 # --- CONFIG ---
-MAX_WIDTH = 1280  # Защита от OOM
+MAX_WIDTH = 640  # Уменьшаем разрешение для стабильности
 MIN_FRAMES = 12  # ЖЕСТКИЙ СТАНДАРТ: Всегда добиваем до 12 кадров
 LOCAL_FRAMES = 5  # Стандартное окно (безопасно для длины 12)
 

@@ -150,6 +150,7 @@ def safe_raft_inference(
     
     logger.start_stage("RAFT Inference")
     
+    # Try GPU inference first
     try:
         # Apply downscale if needed
         if scale_factor < 1.0:
@@ -227,18 +228,44 @@ def safe_raft_inference(
             raft_model_cpu = raft_model.cpu()
             
             try:
-                # Try with even smaller scale on CPU
+                # Try with even smaller scale on CPU (no recursion)
                 smaller_scale = max(0.125, scale_factor * 0.5)
                 logger.log("DEBUG", f"Trying smaller scale on CPU: {smaller_scale}x", "📉")
                 
-                # Recursive call on CPU with smaller scale
-                result = safe_raft_inference(
-                    video_cpu, raft_model_cpu, smaller_scale, raft_iter, 
-                    logger, enable_cpu_fallback=False
-                )
+                # Simple CPU inference without recursion
+                h_small = int(h_orig * smaller_scale)
+                w_small = int(w_orig * smaller_scale)
                 
-                # Move result back to original device
-                result = (result[0].to(device), result[1].to(device))
+                # Reshape and downscale
+                video_reshaped = video_cpu.view(-1, c, h_orig, w_orig)
+                video_small = F.interpolate(
+                    video_reshaped.float(),
+                    size=(h_small, w_small),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                video_small = video_small.view(b, t, c, h_small, w_small)
+                
+                # Run RAFT on CPU
+                with torch.no_grad():
+                    flows_small = raft_model_cpu(video_small, iters=raft_iter)
+                
+                # Upscale flows
+                flows_large = []
+                for flow in flows_small:
+                    bf, tf, cf, hf, wf = flow.shape
+                    flow_flat = flow.view(-1, cf, hf, wf)
+                    upscaled = F.interpolate(
+                        flow_flat,
+                        size=(h_orig, w_orig),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    upscaled = upscaled * (1.0 / smaller_scale)
+                    upscaled = upscaled.view(bf, tf, cf, h_orig, w_orig)
+                    flows_large.append(upscaled)
+                
+                result = (flows_large[0].to(device), flows_large[1].to(device))
                 
                 logger.log("INFO", "CPU fallback successful", "✅")
                 logger.end_stage("RAFT Inference")
@@ -246,7 +273,8 @@ def safe_raft_inference(
                 
             except Exception as cpu_error:
                 logger.log("ERROR", f"CPU fallback also failed: {cpu_error}", "❌")
-                raise cpu_error
+                # Re-raise the original GPU error for better debugging
+                raise e
         else:
             logger.log("ERROR", f"RAFT inference failed: {e}", "❌")
             raise e

@@ -133,6 +133,7 @@ def safe_raft_inference(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Safe RAFT inference with downscale-upscale strategy and CPU fallback.
+    Упрощенная версия с минимальными проверками и агрессивным downscale.
     
     Args:
         video_tensor: Input video tensor [B, T, C, H, W]
@@ -150,98 +151,60 @@ def safe_raft_inference(
     
     logger.start_stage("RAFT Inference")
     
+    # Упрощенная стратегия: всегда используем агрессивный downscale для стабильности
+    # Начинаем с 0.25x вместо 0.5x для большей экономии памяти
+    safe_scale_factor = min(scale_factor, 0.25)  # Максимум 0.25x для безопасности
+    
+    logger.log("INFO", f"Using safe scale factor: {safe_scale_factor}x (original: {scale_factor}x)", "🛡️")
+    
     # Try GPU inference first
     try:
-        # Apply downscale if needed
-        if scale_factor < 1.0:
-            h_small = int(h_orig * scale_factor)
-            w_small = int(w_orig * scale_factor)
-            
-            logger.log("DEBUG", f"Downscaling: {h_orig}x{w_orig} -> {h_small}x{w_small}", "📉")
-            
-            # Reshape for processing: [B, T, C, H, W] -> [B*T, C, H, W]
-            video_reshaped = video_tensor.view(-1, c, h_orig, w_orig)
-            
-            # Downscale for RAFT computation
-            video_small = F.interpolate(
-                video_reshaped.float(),
-                size=(h_small, w_small),
-                mode='bilinear',
-                align_corners=False
-            )
-            
-            # Reshape back: [B*T, C, H_small, W_small] -> [B, T, C, H_small, W_small]
-            video_small = video_small.view(b, t, c, h_small, w_small)
-            
-            # Run RAFT on downscaled video with comprehensive error handling
-            try:
-                # Validate input tensor before RAFT
-                logger.log("DEBUG", f"RAFT input shape: {video_small.shape}, dtype: {video_small.dtype}", "🔍")
-                
-                # Ensure tensor is in correct format for RAFT
-                if video_small.dtype != torch.float32:
-                    logger.log("WARNING", f"Converting RAFT input from {video_small.dtype} to float32", "⚠️")
-                    video_small = video_small.float()
-                
-                # Check for NaN/Inf values
-                if torch.isnan(video_small).any() or torch.isinf(video_small).any():
-                    logger.log("ERROR", "RAFT input contains NaN or Inf values", "❌")
-                    raise ValueError("Input tensor contains invalid values")
-                
-                with torch.no_grad():
-                    flows_small = raft_model(video_small, iters=raft_iter)
-                
-                logger.log("DEBUG", f"RAFT output shapes: {[f.shape for f in flows_small]}", "✅")
-                
-            except Exception as raft_error:
-                logger.log("ERROR", f"RAFT model forward failed: {raft_error}", "❌")
-                
-                # Detailed error analysis
-                error_str = str(raft_error).lower()
-                if "cuda" in error_str or "cuda" in error_str:
-                    logger.log("WARNING", "CUDA error detected in RAFT forward", "⚠️")
-                    
-                    # Try multiple recovery strategies
-                    recovery_strategies = [
-                        ("Clearing cache and retrying", lambda: torch.cuda.empty_cache()),
-                        ("Reducing scale factor further", lambda: max(0.125, scale_factor * 0.25)),
-                        ("Using CPU fallback", lambda: "cpu_fallback")
-                    ]
-                    
-                    for strategy_name, strategy in recovery_strategies:
-                        logger.log("DEBUG", f"Trying recovery: {strategy_name}", "🔄")
-                        
-                        try:
-                            if strategy_name == "Clearing cache and retrying":
-                                torch.cuda.empty_cache()
-                                with torch.no_grad():
-                                    flows_small = raft_model(video_small, iters=raft_iter)
-                                logger.log("INFO", "RAFT retry successful after cache clear", "✅")
-                                break
-                                
-                            elif strategy_name == "Reducing scale factor further":
-                                smaller_scale = max(0.125, scale_factor * 0.25)
-                                logger.log("DEBUG", f"Trying smaller scale: {smaller_scale}x", "📉")
-                                # Recursive call with smaller scale
-                                return safe_raft_inference(
-                                    video_tensor, raft_model, smaller_scale, 
-                                    raft_iter, logger, enable_cpu_fallback
-                                )
-                                
-                            elif strategy_name == "Using CPU fallback" and enable_cpu_fallback:
-                                raise RuntimeError("Trigger CPU fallback")
-                                
-                        except Exception as recovery_error:
-                            logger.log("DEBUG", f"Recovery '{strategy_name}' failed: {recovery_error}", "⚠️")
-                            continue
-                    
-                    # If all recoveries failed
-                    logger.log("ERROR", "All RAFT recovery strategies failed", "❌")
-                    raise RuntimeError(f"RAFT forward failed after all recovery attempts: {raft_error}")
-                    
-                else:
-                    # Not a CUDA error
-                    raise RuntimeError(f"RAFT forward failed: {raft_error}")
+        # Всегда применяем downscale для безопасности
+        h_small = max(64, int(h_orig * safe_scale_factor))  # Минимум 64 пикселя
+        w_small = max(64, int(w_orig * safe_scale_factor))
+        
+        logger.log("DEBUG", f"Safe downscaling: {h_orig}x{w_orig} -> {h_small}x{w_small}", "📉")
+        
+        # Простая проверка модели RAFT
+        if not hasattr(raft_model, 'iters'):
+            logger.log("WARNING", "RAFT model missing 'iters' attribute, setting default", "⚠️")
+        
+        # Проверка входных данных
+        if torch.isnan(video_tensor).any() or torch.isinf(video_tensor).any():
+            logger.log("ERROR", "Input tensor contains NaN or Inf values", "❌")
+            # Заменяем NaN/Inf нулями
+            video_tensor = torch.nan_to_num(video_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+            logger.log("WARNING", "Fixed NaN/Inf values in input tensor", "⚠️")
+        
+        # Reshape for processing: [B, T, C, H, W] -> [B*T, C, H, W]
+        video_reshaped = video_tensor.view(-1, c, h_orig, w_orig)
+        
+        # Downscale for RAFT computation
+        video_small = F.interpolate(
+            video_reshaped.float(),
+            size=(h_small, w_small),
+            mode='bilinear',
+            align_corners=False
+        )
+        
+        # Reshape back: [B*T, C, H_small, W_small] -> [B, T, C, H_small, W_small]
+        video_small = video_small.view(b, t, c, h_small, w_small)
+        
+        # Простая проверка перед RAFT
+        logger.log("DEBUG", f"RAFT input: shape={video_small.shape}, dtype={video_small.dtype}, device={video_small.device}", "🔍")
+        
+        # Убедимся, что тензор в правильном формате
+        video_small = video_small.float()
+        
+        # Очистка кэша перед вызовом RAFT
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Упрощенный вызов RAFT с минимальной оберткой
+        try:
+            with torch.no_grad():
+                flows_small = raft_model(video_small, iters=raft_iter)
+            logger.log("DEBUG", f"RAFT success: output shapes={[f.shape for f in flows_small]}", "✅")
             
             # Upscale flows back to original size
             flows_large = []
@@ -261,7 +224,7 @@ def safe_raft_inference(
                 )
                 
                 # Scale flow values (optical flow scales with image size)
-                upscaled = upscaled * (1.0 / scale_factor)
+                upscaled = upscaled * (1.0 / safe_scale_factor)
                 
                 # Reshape back: [B, T-1, 2, H_orig, W_orig]
                 upscaled = upscaled.view(bf, tf, cf, h_orig, w_orig)
@@ -273,28 +236,79 @@ def safe_raft_inference(
             del video_small, flows_small, video_reshaped
             torch.cuda.empty_cache()
             
-        else:
-            # Original resolution is fine, use standard approach
-            logger.log("DEBUG", "Using original resolution for RAFT", "🌊")
+        except Exception as e:
+            logger.log("ERROR", f"RAFT direct call failed: {e}", "❌")
+            # Пробуем с меньшим количеством итераций
+            logger.log("WARNING", f"Trying with reduced iterations: {raft_iter} -> {max(5, raft_iter//2)}", "🔄")
             try:
                 with torch.no_grad():
-                    gt_flows_bi = raft_model(video_tensor.float(), iters=raft_iter)
-            except Exception as raft_error:
-                logger.log("ERROR", f"RAFT model forward failed at original resolution: {raft_error}", "❌")
-                # Check if it's a CUDA error
-                if "CUDA" in str(raft_error) or "cuda" in str(raft_error).lower():
-                    logger.log("WARNING", "CUDA error detected in RAFT forward", "⚠️")
-                    # Try to clear cache and retry once
-                    torch.cuda.empty_cache()
-                    try:
-                        with torch.no_grad():
-                            gt_flows_bi = raft_model(video_tensor.float(), iters=raft_iter)
-                        logger.log("INFO", "RAFT retry successful after cache clear", "✅")
-                    except Exception as retry_error:
-                        logger.log("ERROR", f"RAFT retry also failed: {retry_error}", "❌")
-                        raise RuntimeError(f"RAFT forward failed even after retry: {retry_error}")
-                else:
-                    raise RuntimeError(f"RAFT forward failed: {raft_error}")
+                    flows_small = raft_model(video_small, iters=max(5, raft_iter//2))
+                logger.log("INFO", "RAFT succeeded with reduced iterations", "✅")
+                
+                # Upscale flows back to original size
+                flows_large = []
+                for flow in flows_small:
+                    bf, tf, cf, hf, wf = flow.shape
+                    flow_flat = flow.view(-1, cf, hf, wf)
+                    upscaled = F.interpolate(
+                        flow_flat,
+                        size=(h_orig, w_orig),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    upscaled = upscaled * (1.0 / safe_scale_factor)
+                    upscaled = upscaled.view(bf, tf, cf, h_orig, w_orig)
+                    flows_large.append(upscaled)
+                
+                gt_flows_bi = tuple(flows_large)
+                
+                # Clean up to free memory
+                del video_small, flows_small, video_reshaped
+                torch.cuda.empty_cache()
+                
+            except Exception as e2:
+                logger.log("ERROR", f"RAFT failed even with reduced iterations: {e2}", "❌")
+                # Если все попытки не удались, пробуем оригинальное разрешение с агрессивным downscale
+                logger.log("WARNING", "Trying original resolution with ultra-low scale (0.125x)", "🔄")
+                try:
+                    # Используем ультра-агрессивный downscale
+                    ultra_scale = 0.125
+                    h_ultra = max(32, int(h_orig * ultra_scale))
+                    w_ultra = max(32, int(w_orig * ultra_scale))
+                    
+                    video_reshaped = video_tensor.view(-1, c, h_orig, w_orig)
+                    video_ultra = F.interpolate(
+                        video_reshaped.float(),
+                        size=(h_ultra, w_ultra),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    video_ultra = video_ultra.view(b, t, c, h_ultra, w_ultra)
+                    
+                    with torch.no_grad():
+                        flows_ultra = raft_model(video_ultra, iters=5)  # Минимальные итерации
+                    
+                    # Upscale flows
+                    flows_large = []
+                    for flow in flows_ultra:
+                        bf, tf, cf, hf, wf = flow.shape
+                        flow_flat = flow.view(-1, cf, hf, wf)
+                        upscaled = F.interpolate(
+                            flow_flat,
+                            size=(h_orig, w_orig),
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                        upscaled = upscaled * (1.0 / ultra_scale)
+                        upscaled = upscaled.view(bf, tf, cf, h_orig, w_orig)
+                        flows_large.append(upscaled)
+                    
+                    gt_flows_bi = tuple(flows_large)
+                    logger.log("INFO", "RAFT succeeded with ultra-low scale", "✅")
+                    
+                except Exception as e3:
+                    logger.log("ERROR", f"All RAFT attempts failed: {e3}", "❌")
+                    raise RuntimeError(f"RAFT inference failed after all recovery attempts: {e3}")
         
         logger.end_stage("RAFT Inference")
         return gt_flows_bi

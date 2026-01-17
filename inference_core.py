@@ -117,7 +117,7 @@ def run_pipeline(args):
     if not f_files: raise ValueError("No frames found")
 
     # Model
-    model = InpaintGenerator(model_path=args.model_path).to(device).half().eval()
+    model = InpaintGenerator(model_path=args.model_path).to(device).float().eval()
 
     # Dimensions
     ref_img = smart_imread(f_files[0])
@@ -163,14 +163,14 @@ def run_pipeline(args):
 
     # Convert to Raw Flow
     raw_flow = [(t.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8) for t in video_list]
-    frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).half()
-    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).half()
+    frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).float()
+    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).float()
 
     # Flow
     log(f"Computing flow for {len(video_list)} frames...")
     fwd_cpu, bwd_cpu = compute_flow_opencv(raw_flow)
-    fwd_gpu = fwd_cpu.to(device).half()
-    bwd_gpu = bwd_cpu.to(device).half()
+    fwd_gpu = fwd_cpu.to(device).float()
+    bwd_gpu = bwd_cpu.to(device).float()
 
     # Inference
     log(f"Inference with LOCAL_FRAMES={LOCAL_FRAMES}...")

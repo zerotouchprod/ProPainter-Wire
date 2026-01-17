@@ -260,3 +260,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     try:
+        run_pipeline(args)
+    except Exception as e:
+        print(f"\n❌ FATAL: {e}")
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)

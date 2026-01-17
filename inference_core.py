@@ -9,17 +9,11 @@ import re
 from PIL import Image
 
 # --- CONFIG ---
-# Используем FP32, поэтому разрешение должно быть скромным
-SAFE_SHORT_SIDE = 640   
-MIN_FRAMES = 8          
-LOCAL_FRAMES = 5        # Стандартное окно
+MAX_WIDTH = 1280        # Оставляем, на CPU память (RAM) дешевая, можно и больше, но 1280 безопасно.
+MIN_FRAMES = 8          # Паддинг для стабильности алгоритма
+LOCAL_FRAMES = 5        # На CPU можно вернуть нормальное качество (5 соседей)
 
 # --- SETUP ---
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-# Включим TF32 для стабильности
-torch.backends.cuda.matmul.allow_tf32 = True 
-torch.backends.cudnn.allow_tf32 = True
-
 warnings.filterwarnings("ignore")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,6 +23,7 @@ def log(msg):
     print(f"[Core] {msg}", flush=True)
 
 def smart_imread(img_path, grayscale=False):
+    """ Robust Image Reader """
     def try_load(path):
         if not os.path.exists(path): return None
         try:
@@ -64,6 +59,7 @@ def smart_imread(img_path, grayscale=False):
     return None
 
 def generate_fallback_mask(h, w):
+    # log("   Generating synthetic mask")
     mask = np.zeros((h, w), dtype=np.uint8)
     x, y = int(0.05*w), int(0.5*h)
     mw, mh = int(0.9*w), int(0.3*h)
@@ -89,7 +85,7 @@ def compute_flow_opencv(frames, downscale_factor=0.5):
     def calc(prev, curr):
         flow = cv2.calcOpticalFlowFarneback(prev, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR) * (1.0/downscale_factor)
-        # FP32 return
+        # CPU Tensor
         return torch.from_numpy(flow).permute(2, 0, 1).unsqueeze(0)
 
     for i in range(len(frames)-1): fwd.append(calc(gray[i], gray[i+1]))
@@ -97,14 +93,16 @@ def compute_flow_opencv(frames, downscale_factor=0.5):
     return torch.stack(fwd, dim=1), torch.stack(bwd, dim=1)
 
 def run_pipeline(args):
-    log("Starting (GPU + FP32 Mode)...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # FORCE CPU
+    log("Starting (CPU MODE)...")
+    device = torch.device("cpu")
 
     f_files = sorted([os.path.join(args.video, f) for f in os.listdir(args.video) if f.endswith(('.jpg', '.png', '.jpeg'))])
     m_files = sorted([os.path.join(args.mask, f) for f in os.listdir(args.mask) if f.endswith(('.jpg', '.png', '.jpeg'))])
+    
     if not f_files: raise ValueError("No frames found")
     
-    # Model -> FLOAT (FP32)
+    # Load Model to CPU (Float32)
     model = InpaintGenerator(model_path=args.model_path).to(device).float().eval()
 
     # Resolution
@@ -117,8 +115,10 @@ def run_pipeline(args):
 
     orig_h, orig_w = ref_img.shape[:2]
     
-    if orig_w < orig_h: scale = SAFE_SHORT_SIDE / orig_w
-    else: scale = SAFE_SHORT_SIDE / orig_h
+    # Use 640p for CPU speed
+    SAFE_SIDE = 640
+    if orig_w < orig_h: scale = SAFE_SIDE / orig_w
+    else: scale = SAFE_SIDE / orig_h
         
     target_w = int(orig_w * scale)
     target_h = int(orig_h * scale)
@@ -135,7 +135,7 @@ def run_pipeline(args):
         if img.shape[:2] != (target_h, target_w):
             img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         img_pad = pad_img_to_modulo(img, 16)
-        # FLOAT TENSORS
+        # CPU Float
         video_list.append(torch.from_numpy(img_pad).permute(2,0,1).float()/255.0)
 
         msk = smart_imread(m_p, True)
@@ -154,26 +154,21 @@ def run_pipeline(args):
             video_list.append(video_list[-1])
             mask_list.append(mask_list[-1])
 
-    # Stack Float
-    frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).float()
-    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).float()
+    # Stack on CPU
+    frames_tensor = torch.stack(video_list).unsqueeze(0).to(device)
+    masks_tensor = torch.stack(mask_list).unsqueeze(0).to(device)
     
+    # Flow
     raw_flow = [(t.permute(1,2,0).numpy()*255.0).astype(np.uint8) for t in video_list]
-    fwd_cpu, bwd_cpu = compute_flow_opencv(raw_flow)
-    # Flow Float
-    fwd_gpu = fwd_cpu.to(device).float()
-    bwd_gpu = bwd_cpu.to(device).float()
+    fwd_flow, bwd_flow = compute_flow_opencv(raw_flow)
+    # Ensure flow is on CPU
+    fwd_flow = fwd_flow.to(device)
+    bwd_flow = bwd_flow.to(device)
 
     # Inference
-    log(f"Inference (FP32)...")
-    torch.cuda.empty_cache()
-    # Trim flows to LOCAL_FRAMES-1 (model expects flows for local frames only)
-    fwd_trim = fwd_gpu[:, :LOCAL_FRAMES-1]
-    bwd_trim = bwd_gpu[:, :LOCAL_FRAMES-1]
-    # Safe Context
-    with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
-        with torch.no_grad():
-            pred = model(frames_gpu, (fwd_trim, bwd_trim), masks_gpu, masks_gpu, LOCAL_FRAMES)[0]
+    log(f"Inference (CPU, Local={LOCAL_FRAMES})...")
+    with torch.no_grad():
+        pred = model(frames_tensor, (fwd_flow, bwd_flow), masks_tensor, masks_tensor, LOCAL_FRAMES)[0]
 
     # Save
     log(f"Saving...")
@@ -181,7 +176,7 @@ def run_pipeline(args):
     for i in range(original_length):
         f_path = f_files[i]
         
-        p = pred[i].permute(1,2,0).cpu().numpy().clip(0,1)
+        p = pred[i].permute(1,2,0).numpy().clip(0,1)
         p = p[:target_h, :target_w, :] 
         
         if (target_h, target_w) != (orig_h, orig_w):

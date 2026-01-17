@@ -5,14 +5,13 @@ import torch
 import argparse
 import numpy as np
 import warnings
+import re
 from PIL import Image
 
-# PARANOID STABILITY SETTINGS
+# 1. TUNING FOR STABILITY
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 warnings.filterwarnings("ignore")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -22,19 +21,18 @@ from model.propainter import InpaintGenerator
 
 def smart_imread(img_path, grayscale=False):
     """
-    Robust Image Reader.
-    1. Tries to read from the given path.
-    2. If fails (broken symlink), hunts for the file in parent 'frames' or 'masks' folders.
+    Robust Reader. Handles:
+    1. Broken Symlinks
+    2. Missing Files
+    3. Index Mismatch (0-based vs 1-based)
     """
 
     def try_load(path):
         if not os.path.exists(path): return None
         try:
             if grayscale:
-                # Open as grayscale
                 return np.array(Image.open(path).convert('L'))
             else:
-                # Open as RGB
                 return np.array(Image.open(path).convert('RGB'))
         except:
             return None
@@ -43,33 +41,45 @@ def smart_imread(img_path, grayscale=False):
     img = try_load(img_path)
     if img is not None: return img
 
-    # 2. Broken Symlink Fallback
-    print(f"⚠️ [IO] Broken link detected: {img_path}")
-
-    dir_name = os.path.dirname(img_path)  # .../chunk_000/frames
-    file_name = os.path.basename(img_path)  # frame_000.png
+    # 2. Fallback Logic
+    # print(f"⚠️ [IO] Broken link: {os.path.basename(img_path)}")
+    dir_name = os.path.dirname(img_path)
+    file_name = os.path.basename(img_path)
     folder_type = os.path.basename(dir_name)  # 'frames' or 'masks'
-
-    # Heuristic: Go up 2 levels (chunk_000 -> job_root)
-    # Structure: job/chunk_000/frames -> job/frames
     job_root = os.path.dirname(os.path.dirname(dir_name))
 
-    # Try direct parent folder
-    fallback_1 = os.path.join(job_root, folder_type, file_name)
-    img = try_load(fallback_1)
-    if img is not None:
-        print(f"✅ [IO] Recovered from: {fallback_1}")
-        return img
-
-    # Try one level deeper (sometimes masks are in job/masks/output?)
-    # Or just 'masks' at root if folder_type was something else
+    # Define potential fallback directories
+    fallback_dirs = [os.path.join(job_root, folder_type)]
     if folder_type == 'masks':
-        fallback_2 = os.path.join(job_root, 'masks', file_name)
-        img = try_load(fallback_2)
-        if img is not None: return img
+        fallback_dirs.append(os.path.join(job_root, 'masks'))
 
-    # If all fails
-    raise ValueError(f"CRITICAL: Could not recover file {file_name}. Checked: {img_path}, {fallback_1}")
+    # Regex to parse "frame_000123.png" -> number 123
+    match = re.search(r'(\d+)', file_name)
+    if not match:
+        raise ValueError(f"CRITICAL: Cannot parse filename {file_name}")
+
+    idx = int(match.group(1))
+    prefix = file_name[:match.start(1)]
+    suffix = file_name[match.end(1):]
+
+    # Try indices: [original, +1, -1]
+    # Because ffmpeg starts at 1, but python script might ask for 0
+    indices_to_try = [idx, idx + 1, idx - 1]
+
+    for d in fallback_dirs:
+        for i in indices_to_try:
+            # Reconstruct filename: frame_ + 000123 + .png
+            # Assuming 6 digits padding is standard here based on logs
+            candidate_name = f"{prefix}{i:06d}{suffix}"
+            candidate_path = os.path.join(d, candidate_name)
+
+            img = try_load(candidate_path)
+            if img is not None:
+                # print(f"✅ [IO] Recovered {file_name} -> {candidate_name}")
+                return img
+
+    raise ValueError(
+        f"CRITICAL: Could not recover {file_name} (Checked dirs: {fallback_dirs}, indices: {indices_to_try})")
 
 
 def pad_img_to_modulo(img, mod):
@@ -86,7 +96,6 @@ def compute_flow_opencv(frames, downscale_factor=0.5):
 
     gray_frames = []
     for f in frames:
-        # Frames are already Numpy arrays [H,W,3] RGB
         g = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY)
         g = cv2.resize(g, (w_s, h_s), interpolation=cv2.INTER_LINEAR)
         gray_frames.append(g)
@@ -97,7 +106,7 @@ def compute_flow_opencv(frames, downscale_factor=0.5):
         flow = cv2.calcOpticalFlowFarneback(prev, curr, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         flow_full = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR)
         flow_full *= (1.0 / downscale_factor)
-        return torch.from_numpy(flow_full).permute(2, 0, 1).float().contiguous().unsqueeze(0)
+        return torch.from_numpy(flow_full).permute(2, 0, 1).unsqueeze(0)  # Keep on CPU for now
 
     for i in range(len(frames) - 1):
         flows_forward.append(calc_flow(gray_frames[i], gray_frames[i + 1]))
@@ -108,11 +117,12 @@ def compute_flow_opencv(frames, downscale_factor=0.5):
 
 
 def run_pipeline(args):
-    print("🚀 [Core] Starting ProPainter (Smart-IO + Masks Fix)...")
+    print("🚀 [Core] Starting ProPainter (Index Fix + FP16)...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("📦 Loading Model (FP32)...")
-    model = InpaintGenerator(model_path=args.model_path).to(device).float().eval()
+    # LOAD MODEL FP16
+    print("📦 Loading Model...")
+    model = InpaintGenerator(model_path=args.model_path).to(device).half().eval()
 
     f_files = sorted(
         [os.path.join(args.video, f) for f in os.listdir(args.video) if f.endswith(('.jpg', '.png', '.jpeg'))])
@@ -122,66 +132,65 @@ def run_pipeline(args):
     if not f_files: raise ValueError("No frames found")
     print(f"🔄 Processing {len(f_files)} frames...")
 
-    # 1. LOAD FRAMES (Smart)
-    raw_frames = [pad_img_to_modulo(smart_imread(f, grayscale=False), 16) for f in f_files]
+    # 1. LOAD REFERENCE DIMS
+    ref_img = smart_imread(f_files[0], grayscale=False)
+    target_h, target_w = ref_img.shape[:2]
+
+    def load_prep(path, gray=False):
+        img = smart_imread(path, gray)
+        if img.shape[:2] != (target_h, target_w):
+            img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_NEAREST if gray else cv2.INTER_LINEAR)
+
+        img = pad_img_to_modulo(img, 16)
+        if gray:
+            img = (img > 127).astype(np.uint8) * 255
+            return (torch.from_numpy(img).float() / 255.0 > 0.5).float().unsqueeze(0)
+        else:
+            return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
     video_list, mask_list = [], []
-    for i, (img, m_path) in enumerate(zip(raw_frames, m_files)):
-        # Frame Tensor
-        t_img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-        video_list.append(t_img.contiguous())
+    raw_frames_flow = []
 
-        # 2. LOAD MASKS (Smart)
-        m_img = smart_imread(m_path, grayscale=True)
-        m_img = pad_img_to_modulo((m_img > 127).astype(np.uint8) * 255, 16)
+    for f_p, m_p in zip(f_files, m_files):
+        t_img = load_prep(f_p, False)
+        t_msk = load_prep(m_p, True)
+        video_list.append(t_img)
+        mask_list.append(t_msk)
+        raw_frames_flow.append((t_img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8))
 
-        t_msk = (torch.from_numpy(m_img).float() / 255.0 > 0.5).float().unsqueeze(0)
-        mask_list.append(t_msk.contiguous())
+    masked_frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).half()
+    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).half()
 
-    masked_frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).contiguous()
-    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).contiguous()
+    # FLOW
+    flows_fwd_cpu, flows_bwd_cpu = compute_flow_opencv(raw_frames_flow)
+    flows_fwd_gpu = flows_fwd_cpu.to(device).half()
+    flows_bwd_gpu = flows_bwd_cpu.to(device).half()
 
-    # 3. FLOW
-    flows_fwd_cpu, flows_bwd_cpu = compute_flow_opencv(raw_frames)
-    flows_fwd_gpu = flows_fwd_cpu.to(device).contiguous()
-    flows_bwd_gpu = flows_bwd_cpu.to(device).contiguous()
+    torch.cuda.empty_cache()
 
-    # 4. INFERENCE (Safe Attention)
+    # INFERENCE
     print("⚡ ProPainter Inference...")
-    with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+    # Safe Context
+    with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
         with torch.no_grad():
             pred = model(masked_frames_gpu, (flows_fwd_gpu, flows_bwd_gpu), masks_gpu)[0]
 
-    # 5. SAVE
+    # SAVE
     print("💾 Saving...")
     os.makedirs(args.output, exist_ok=True)
 
-    # Get original size from the first successfully loaded frame
-    # (Since raw_frames are padded, we need to unpad carefully or just crop)
-    # The safest way is to crop to the size of the 'real' image on disk.
-    # But for speed, let's use the first frame's original dims (before padding)
-    # Wait, smart_imread returns unpadded. pad_img_to_modulo adds padding.
-    # We can get original size from smart_imread(f_files[0]) again?
-    # Or just calc it from raw_frames[0] minus padding?
-    # Simpler: Load one original frame to get dims.
-    ref_img = smart_imread(f_files[0], grayscale=False)
-    orig_h, orig_w = ref_img.shape[:2]
-
     for i, f_path in enumerate(f_files):
-        p = pred[i].permute(1, 2, 0).cpu().numpy().clip(0, 1)
-        p = p[:orig_h, :orig_w, :]
+        p = pred[i].permute(1, 2, 0).float().cpu().numpy().clip(0, 1)
+        p = p[:target_h, :target_w, :]
 
-        # We need the original image for background compositing
-        # Since we already have raw_frames (padded), we can unpad it
-        orig_padded = raw_frames[i].astype(float) / 255.0
-        orig = orig_padded[:orig_h, :orig_w, :]
+        # Load originals for comp using smart read
+        orig = smart_imread(f_path).astype(float) / 255.0
+        m = (smart_imread(m_files[i], True).astype(float) / 255.0 > 0.5)[:, :, None]
 
-        # Same for mask
-        m_padded = (mask_list[i].cpu().numpy().squeeze() > 0.5).astype(float)[:, :, None]
-        m = m_padded[:orig_h, :orig_w, :]
+        if orig.shape[:2] != (target_h, target_w): orig = cv2.resize(orig, (target_w, target_h))
+        if m.shape[:2] != (target_h, target_w): m = cv2.resize(m, (target_w, target_h))[:, :, None]
 
         final = p * m + orig * (1 - m)
-
         out_path = os.path.join(args.output, os.path.basename(f_path))
         Image.fromarray((final * 255).astype(np.uint8)).save(out_path)
 
@@ -194,7 +203,6 @@ if __name__ == '__main__':
     parser.add_argument('--mask', type=str, required=True)
     parser.add_argument('--output', type=str, required=True)
     parser.add_argument('--model_path', type=str, default='weights/ProPainter.pth')
-    # Ignored
     parser.add_argument('--raft_model_path', type=str, default=None)
     parser.add_argument('--fc_model_path', type=str, default=None)
     parser.add_argument('--raft_iter', type=int, default=20)

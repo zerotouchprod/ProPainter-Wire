@@ -103,8 +103,8 @@ def run_pipeline(args):
     m_files = sorted([os.path.join(args.mask, f) for f in os.listdir(args.mask) if f.endswith(('.jpg', '.png', '.jpeg'))])
     if not f_files: raise ValueError("No frames found")
     
-    # Model (FP16)
-    model = InpaintGenerator(model_path=args.model_path).to(device).half().eval()
+    # Model (FP32)
+    model = InpaintGenerator(model_path=args.model_path).to(device).float().eval()
 
     # Resolution
     ref_img = smart_imread(f_files[0])
@@ -153,14 +153,14 @@ def run_pipeline(args):
             video_list.append(video_list[-1])
             mask_list.append(mask_list[-1])
 
-    frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).half()
-    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).half()
+    frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).float()
+    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).float()
     
     # Flow (CPU)
     raw_flow = [(t.permute(1,2,0).numpy()*255.0).astype(np.uint8) for t in video_list]
     fwd_cpu, bwd_cpu = compute_flow_opencv(raw_flow)
-    fwd_gpu = fwd_cpu.to(device).half()
-    bwd_gpu = bwd_cpu.to(device).half()
+    fwd_gpu = fwd_cpu.to(device).float()
+    bwd_gpu = bwd_cpu.to(device).float()
 
     # Inference
     log(f"Inference (Local={LOCAL_FRAMES})...")

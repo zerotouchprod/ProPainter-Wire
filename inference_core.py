@@ -48,18 +48,11 @@ def main(args):
     model.eval()
 
     # 2. Precision Optimization (FP16)
+    # FORCE FP32 for stability
+    # FP16 causes CUBLAS errors in Transformer layers on RTX 30/40 series
     use_half = False
-    if torch.cuda.is_available():
-        try:
-            # Try to switch to half precision
-            model = model.half()
-            use_half = True
-            print("✅ Precision: FP16 (Half) enabled [VRAM Optimized]")
-        except Exception as e:
-            print(f"⚠️ FP16 failed, falling back to FP32. Error: {e}")
-            model = model.float()
-    else:
-        print("⚠️ Running on CPU (Slow!)")
+    model = model.float()
+    print("🛡️ Precision: FP32 (Forced) - Stability Mode Enabled")
 
     # 3. Prepare Data
     frames = sorted([os.path.join(args.video, f) for f in os.listdir(args.video) if f.endswith(('.jpg', '.png', '.jpeg'))])

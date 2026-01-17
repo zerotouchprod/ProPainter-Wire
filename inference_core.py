@@ -173,9 +173,26 @@ def safe_raft_inference(
             # Reshape back: [B*T, C, H_small, W_small] -> [B, T, C, H_small, W_small]
             video_small = video_small.view(b, t, c, h_small, w_small)
             
-            # Run RAFT on downscaled video
-            with torch.no_grad():
-                flows_small = raft_model(video_small, iters=raft_iter)
+            # Run RAFT on downscaled video with additional error handling
+            try:
+                with torch.no_grad():
+                    flows_small = raft_model(video_small, iters=raft_iter)
+            except Exception as raft_error:
+                logger.log("ERROR", f"RAFT model forward failed: {raft_error}", "❌")
+                # Check if it's a CUDA error
+                if "CUDA" in str(raft_error) or "cuda" in str(raft_error).lower():
+                    logger.log("WARNING", "CUDA error detected in RAFT forward", "⚠️")
+                    # Try to clear cache and retry once
+                    torch.cuda.empty_cache()
+                    try:
+                        with torch.no_grad():
+                            flows_small = raft_model(video_small, iters=raft_iter)
+                        logger.log("INFO", "RAFT retry successful after cache clear", "✅")
+                    except Exception as retry_error:
+                        logger.log("ERROR", f"RAFT retry also failed: {retry_error}", "❌")
+                        raise RuntimeError(f"RAFT forward failed even after retry: {retry_error}")
+                else:
+                    raise RuntimeError(f"RAFT forward failed: {raft_error}")
             
             # Upscale flows back to original size
             flows_large = []
@@ -210,8 +227,25 @@ def safe_raft_inference(
         else:
             # Original resolution is fine, use standard approach
             logger.log("DEBUG", "Using original resolution for RAFT", "🌊")
-            with torch.no_grad():
-                gt_flows_bi = raft_model(video_tensor.float(), iters=raft_iter)
+            try:
+                with torch.no_grad():
+                    gt_flows_bi = raft_model(video_tensor.float(), iters=raft_iter)
+            except Exception as raft_error:
+                logger.log("ERROR", f"RAFT model forward failed at original resolution: {raft_error}", "❌")
+                # Check if it's a CUDA error
+                if "CUDA" in str(raft_error) or "cuda" in str(raft_error).lower():
+                    logger.log("WARNING", "CUDA error detected in RAFT forward", "⚠️")
+                    # Try to clear cache and retry once
+                    torch.cuda.empty_cache()
+                    try:
+                        with torch.no_grad():
+                            gt_flows_bi = raft_model(video_tensor.float(), iters=raft_iter)
+                        logger.log("INFO", "RAFT retry successful after cache clear", "✅")
+                    except Exception as retry_error:
+                        logger.log("ERROR", f"RAFT retry also failed: {retry_error}", "❌")
+                        raise RuntimeError(f"RAFT forward failed even after retry: {retry_error}")
+                else:
+                    raise RuntimeError(f"RAFT forward failed: {raft_error}")
         
         logger.end_stage("RAFT Inference")
         return gt_flows_bi

@@ -9,7 +9,8 @@ import torchvision
 from einops import rearrange
 
 from model.modules.base_module import BaseNetwork
-from model.modules.sparse_transformer import TemporalSparseTransformerBlock, SoftSplit, SoftComp
+# Use optimized sparse transformer
+from model.modules.sparse_transformer_updated import TemporalSparseTransformerBlock, SoftSplit, SoftComp
 from model.modules.spectral_norm import spectral_norm as _spectral_norm
 from model.modules.flow_loss_utils import flow_warp
 from model.modules.deformconv import ModulatedDeformConv2d

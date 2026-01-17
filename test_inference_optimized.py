@@ -182,7 +182,7 @@ def test_optimized_inference_structure():
     
     # Import the actual module
     try:
-        from inference_core_optimized import (
+        from inference_core import (
             process_video_in_chunks,
             process_single_chunk,
             pad_img_to_modulo,

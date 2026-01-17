@@ -3,11 +3,12 @@ import torch.nn.functional as F
 from .utils.utils import bilinear_sampler, coords_grid
 from torch.cuda.amp import custom_fwd
 
-try:
-    import alt_cuda_corr
-except:
-    # alt_cuda_corr is not compiled
-    pass
+# FORCE DISABLE alt_cuda_corr for stability on CUDA 12+
+alt_cuda_corr = None 
+# try:
+#     import alt_cuda_corr
+# except:
+#     pass
 
 
 class CorrBlock:
@@ -56,13 +57,10 @@ class CorrBlock:
         fmap1 = fmap1.view(batch, dim, ht*wd)
         fmap2 = fmap2.view(batch, dim, ht*wd)
 
-        # === FIX: FORCE FP32 & CLONE FOR ALIGNMENT ===
-        # .float() ensures we don't use buggy FP16 kernels
-        # .clone() ensures memory is contiguous and aligned
-        fmap1_t = fmap1.transpose(1, 2).float().clone()
-        fmap2_f = fmap2.float().clone()
-        
-        corr = torch.matmul(fmap1_t, fmap2_f)
+        # Force FP32 and Contiguous memory layout
+        f1 = fmap1.float().transpose(1,2).contiguous()
+        f2 = fmap2.float().contiguous()
+        corr = torch.matmul(f1, f2)
         
         corr = corr.view(batch, ht, wd, 1, ht, wd)
         return corr / torch.sqrt(torch.tensor(dim).float())
@@ -94,10 +92,10 @@ class AlternateCorrBlock:
             # Fallback if compiled cuda version is missing
             try:
                 corr = alt_cuda_corr(fmap1_i, fmap2_i, coords_i, r)
-            except NameError:
+            except (NameError, TypeError):
                 # Silent fallback or error if needed. 
                 # Ideally, ProPainter uses standard CorrBlock by default.
-                raise RuntimeError("alt_cuda_corr not compiled")
+                raise RuntimeError("alt_cuda_corr is disabled for stability on CUDA 12+. Use standard CorrBlock (args.alternate_corr=False).")
                 
             corr_list.append(corr.squeeze(1))
 

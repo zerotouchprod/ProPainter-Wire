@@ -178,7 +178,10 @@ def run_pipeline(args):
     with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
         with torch.no_grad():
             # (frames, flows, masks, masks_updated, num_local_frames)
-            pred = model(frames_gpu, (fwd_gpu, bwd_gpu), masks_gpu, masks_gpu, LOCAL_FRAMES)[0]
+            # Trim flows to LOCAL_FRAMES-1 (model expects flows for local frames only)
+            fwd_trim = fwd_gpu[:, :LOCAL_FRAMES-1]
+            bwd_trim = bwd_gpu[:, :LOCAL_FRAMES-1]
+            pred = model(frames_gpu, (fwd_trim, bwd_trim), masks_gpu, masks_gpu, LOCAL_FRAMES)[0]
 
     # Save
     log(f"Saving...")

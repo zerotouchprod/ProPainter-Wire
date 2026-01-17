@@ -217,7 +217,10 @@ def safe_raft_inference(
         return gt_flows_bi
         
     except RuntimeError as e:
-        if "out of memory" in str(e).lower() and enable_cpu_fallback:
+        error_msg = str(e).lower()
+        logger.log("ERROR", f"RAFT inference failed with error: {e}", "❌")
+        
+        if "out of memory" in error_msg and enable_cpu_fallback:
             logger.log("WARNING", "GPU OOM detected, falling back to CPU inference", "⚠️")
             
             # Clear GPU memory
@@ -274,10 +277,10 @@ def safe_raft_inference(
             except Exception as cpu_error:
                 logger.log("ERROR", f"CPU fallback also failed: {cpu_error}", "❌")
                 # Re-raise the original GPU error for better debugging
-                raise e
+                raise RuntimeError(f"GPU RAFT failed: {e}\nCPU fallback also failed: {cpu_error}")
         else:
-            logger.log("ERROR", f"RAFT inference failed: {e}", "❌")
-            raise e
+            # Not an OOM error or fallback disabled
+            raise RuntimeError(f"RAFT inference failed: {e}")
 
 
 def process_video_in_chunks(

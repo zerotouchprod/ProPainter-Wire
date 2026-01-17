@@ -9,7 +9,7 @@ import re
 import inspect
 from PIL import Image
 
-# STABILITY SETTINGS
+# STABILITY
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
@@ -22,6 +22,10 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from model.propainter import InpaintGenerator
 
 MAX_WIDTH = 1280
+
+
+def log(msg):
+    print(f"[Core] {msg}", flush=True)
 
 
 def smart_imread(img_path, grayscale=False):
@@ -65,6 +69,7 @@ def smart_imread(img_path, grayscale=False):
 
 
 def generate_fallback_mask(h, w):
+    log("⚠️ Generating synthetic mask")
     mask = np.zeros((h, w), dtype=np.uint8)
     x, y = int(0.05 * w), int(0.5 * h)
     mw, mh = int(0.9 * w), int(0.3 * h)
@@ -101,35 +106,49 @@ def compute_flow_opencv(frames, downscale_factor=0.5):
 
 
 def run_pipeline(args):
-    print("🚀 [Core] Starting ProPainter...")
+    log("Starting...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = InpaintGenerator(model_path=args.model_path).to(device).half().eval()
+    log(f"Device: {device}")
 
+    # Files
+    if not os.path.exists(args.video): raise ValueError(f"Video path not found: {args.video}")
     f_files = sorted(
         [os.path.join(args.video, f) for f in os.listdir(args.video) if f.endswith(('.jpg', '.png', '.jpeg'))])
     m_files = sorted(
         [os.path.join(args.mask, f) for f in os.listdir(args.mask) if f.endswith(('.jpg', '.png', '.jpeg'))])
-    if not f_files: raise ValueError("No frames")
 
-    # Setup Dims
+    log(f"Found {len(f_files)} frames in {args.video}")
+    if not f_files: raise ValueError("No frames found")
+
+    # Model
+    log("Loading model...")
+    model = InpaintGenerator(model_path=args.model_path).to(device).half().eval()
+    log("Model loaded.")
+
+    # Dims
     ref_img = smart_imread(f_files[0])
     if ref_img is None:
+        log("First frame missing, trying scan...")
         for f in f_files:
             ref_img = smart_imread(f)
             if ref_img is not None: break
-    if ref_img is None: raise ValueError("CRITICAL: No valid frames found")
+    if ref_img is None: raise ValueError("CRITICAL: No valid frames found (smart_imread failed all)")
 
     orig_h, orig_w = ref_img.shape[:2]
+    log(f"Original Dims: {orig_w}x{orig_h}")
+
     scale = 1.0
     if orig_w > MAX_WIDTH: scale = MAX_WIDTH / orig_w
     target_w = (int(orig_w * scale) // 2) * 2
     target_h = (int(orig_h * scale) // 2) * 2
+    log(f"Target Dims: {target_w}x{target_h} (Scale {scale})")
 
-    # Load Data
+    # Load Loop
+    log("Loading data into tensors...")
     video_list, mask_list = [], []
     raw_flow = []
 
-    for f_p, m_p in zip(f_files, m_files):
+    for i, (f_p, m_p) in enumerate(zip(f_files, m_files)):
         img = smart_imread(f_p)
         if img is None: raise ValueError(f"Missing frame {f_p}")
         if img.shape[:2] != (target_h, target_w):
@@ -147,22 +166,35 @@ def run_pipeline(args):
         t_msk = (torch.from_numpy(msk_pad).float() / 255.0 > 0.5).float().unsqueeze(0)
         mask_list.append(t_msk)
 
+    log(f"Loaded {len(video_list)} tensors.")
+
     frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).half()
     masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).half()
+    log(f"GPU Frames Shape: {frames_gpu.shape}")
 
     # Flow
+    log("Computing flow...")
     fwd_cpu, bwd_cpu = compute_flow_opencv(raw_flow)
     fwd_gpu = fwd_cpu.to(device).half()
     bwd_gpu = bwd_cpu.to(device).half()
+    log(f"Flow computed. Shape: {fwd_gpu.shape}")
 
     # Inference
+    log("Running Model Inference...")
     torch.cuda.empty_cache()
     with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
         with torch.no_grad():
+            # (masked_frames, completed_flows, masks, masks_updated, num_local_frames)
             pred = model(frames_gpu, (fwd_gpu, bwd_gpu), masks_gpu, masks_gpu, 0)[0]
 
+    log(f"Inference done. Output shape: {pred.shape}")
+
     # Save
+    log(f"Saving to {args.output}...")
     os.makedirs(args.output, exist_ok=True)
+    if not os.path.exists(args.output): raise ValueError(f"Failed to create dir {args.output}")
+
+    saved_count = 0
     for i, f_path in enumerate(f_files):
         # Result
         p = pred[i].permute(1, 2, 0).float().cpu().numpy().clip(0, 1)
@@ -181,15 +213,17 @@ def run_pipeline(args):
 
         final = p * m + orig * (1 - m)
 
-        # CRITICAL FIX: Use the BASENAME from the INPUT ARGUMENT list
-        # Even if the file was a broken symlink pointing elsewhere,
-        # we must save the output with the name the orchestrator expects (e.g. frame_000000.png)
+        # Filename
         target_filename = os.path.basename(f_files[i])
         out_path = os.path.join(args.output, target_filename)
 
         Image.fromarray((final * 255).astype(np.uint8)).save(out_path)
+        if os.path.exists(out_path):
+            saved_count += 1
+        else:
+            log(f"FAILED TO SAVE {out_path}")
 
-    print("✅ Done.")
+    log(f"✅ Done. Saved {saved_count} files.")
 
 
 if __name__ == '__main__':
@@ -206,7 +240,7 @@ if __name__ == '__main__':
     try:
         run_pipeline(args)
     except Exception as e:
-        print(f"\n❌ FATAL: {e}")
+        print(f"\n❌ FATAL: {e}", flush=True)
         import traceback
 
         traceback.print_exc()

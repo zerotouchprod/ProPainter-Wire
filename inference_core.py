@@ -122,4 +122,124 @@ def run_pipeline(args):
     if not f_files: raise ValueError("No frames found")
 
     # Model
-    model = Inpaint
+    model = InpaintGenerator(model_path=args.model_path).to(device).half().eval()
+
+    # Dimensions & OOM Safety
+    ref_img = smart_imread(f_files[0])
+    if ref_img is None:
+        for f in f_files:
+            ref_img = smart_imread(f)
+            if ref_img is not None: break
+    if ref_img is None: raise ValueError("CRITICAL: All frames missing")
+
+    orig_h, orig_w = ref_img.shape[:2]
+    scale = 1.0
+    if orig_w > MAX_WIDTH: scale = MAX_WIDTH / orig_w
+    target_w = (int(orig_w * scale) // 2) * 2
+    target_h = (int(orig_h * scale) // 2) * 2
+    log(f"Resizing {orig_w}x{orig_h} -> {target_w}x{target_h}")
+
+    # Load Data
+    video_list, mask_list = [], []
+
+    for i, (f_p, m_p) in enumerate(zip(f_files, m_files)):
+        # Frame
+        img = smart_imread(f_p)
+        if img is None: raise ValueError(f"Missing {f_p}")
+        if img.shape[:2] != (target_h, target_w):
+            img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        img_pad = pad_img_to_modulo(img, 16)
+        video_list.append(torch.from_numpy(img_pad).permute(2, 0, 1).float() / 255.0)
+
+        # Mask
+        msk = smart_imread(m_p, True)
+        if msk is None: msk = generate_fallback_mask(target_h, target_w)
+        if msk.shape[:2] != (target_h, target_w):
+            msk = cv2.resize(msk, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        msk_pad = pad_img_to_modulo((msk > 127).astype(np.uint8) * 255, 16)
+        mask_list.append((torch.from_numpy(msk_pad).float() / 255.0 > 0.5).float().unsqueeze(0))
+
+    # --- PADDING LOGIC (The Fix for Short Chunks) ---
+    original_length = len(video_list)
+    if original_length < MIN_FRAMES:
+        pad_count = MIN_FRAMES - original_length
+        log(f"⚠️ Chunk too short ({original_length}). Padding +{pad_count} frames.")
+        for _ in range(pad_count):
+            video_list.append(video_list[-1])
+            mask_list.append(mask_list[-1])
+
+    # Convert to Raw Flow (Numpy)
+    raw_flow = [(t.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8) for t in video_list]
+
+    # To GPU
+    frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).half()
+    masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).half()
+
+    # Flow
+    fwd_cpu, bwd_cpu = compute_flow_opencv(raw_flow)
+    fwd_gpu = fwd_cpu.to(device).half()
+    bwd_gpu = bwd_cpu.to(device).half()
+
+    # Inference
+    log("Running Inference...")
+    torch.cuda.empty_cache()
+    with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
+        with torch.no_grad():
+            # KEY FIX: num_local_frames = 0 (Safe for padded/weird inputs)
+            # masks_updated passed as 4th arg
+            pred = model(frames_gpu, (fwd_gpu, bwd_gpu), masks_gpu, masks_gpu, 0)[0]
+
+    # Save
+    log(f"Saving to {args.output}...")
+    os.makedirs(args.output, exist_ok=True)
+
+    # Save ONLY original frames (discard padding)
+    for i in range(original_length):
+        f_path = f_files[i]
+
+        # Result Processing
+        p = pred[i].permute(1, 2, 0).float().cpu().numpy().clip(0, 1)
+        p = p[:target_h, :target_w, :]  # Crop padding
+
+        # Resize back to original
+        if (target_h, target_w) != (orig_h, orig_w):
+            p = cv2.resize(p, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+
+        # Composition with Original
+        orig = smart_imread(f_path).astype(float) / 255.0
+        m = smart_imread(m_files[i], True)
+        if m is None: m = generate_fallback_mask(orig_h, orig_w)
+        m = (m.astype(float) / 255.0 > 0.5)[:, :, None]
+
+        # Safety resize for composition
+        if orig.shape[:2] != (orig_h, orig_w): orig = cv2.resize(orig, (orig_w, orig_h))
+        if m.shape[:2] != (orig_h, orig_w): m = cv2.resize(m, (orig_w, orig_h))[:, :, None]
+
+        final = p * m + orig * (1 - m)
+
+        # KEY FIX: Save using ORCHESTRATOR'S expected filename
+        target_filename = os.path.basename(f_files[i])
+        out_path = os.path.join(args.output, target_filename)
+
+        Image.fromarray((final * 255).astype(np.uint8)).save(out_path)
+
+    log(f"✅ Done. Saved {original_length} files.")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--video', type=str, required=True)
+    parser.add_argument('--mask', type=str, required=True)
+    parser.add_argument('--output', type=str, required=True)
+    parser.add_argument('--model_path', type=str, default='weights/ProPainter.pth')
+    # Compat args
+    parser.add_argument('--raft_model_path', type=str, default=None)
+    parser.add_argument('--fc_model_path', type=str, default=None)
+    parser.add_argument('--raft_iter', type=int, default=20)
+    args = parser.parse_args()
+
+    try:
+        run_pipeline(args)
+    except Exception as e:
+        print(f"\n❌ FATAL: {e}", flush=True)
+        sys.exit(1)

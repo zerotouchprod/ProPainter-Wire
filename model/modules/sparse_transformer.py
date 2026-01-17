@@ -251,7 +251,8 @@ class SparseWindowAttention(nn.Module):
                 att_t = (win_q_t.float() @ win_k_t.float().transpose(-2, -1)).type_as(win_q_t) * (1.0 / math.sqrt(win_q_t.size(-1)))
                 att_t = F.softmax(att_t, dim=-1)
                 att_t = self.attn_drop(att_t)
-                y_t = torch.matmul(att_t.float(), win_v_t.float().clone())
+                # Safe mixed precision: FP32 for matmul, cast back to input dtype
+                y_t = (att_t.float() @ win_v_t.float()).type_as(win_v_t)
                 
                 out[i, mask_ind_i] = y_t.view(-1, self.n_head, t, w_h*w_w, c_head)
 
@@ -267,7 +268,8 @@ class SparseWindowAttention(nn.Module):
             att_s = (win_q_s.float() @ win_k_s.float().transpose(-2, -1)).type_as(win_q_s) * (1.0 / math.sqrt(win_q_s.size(-1)))
             att_s = F.softmax(att_s, dim=-1)
             att_s = self.attn_drop(att_s)
-            y_s = torch.matmul(att_s.float(), win_v_s.float().clone())
+            # Safe mixed precision: FP32 for matmul, cast back to input dtype
+            y_s = (att_s.float() @ win_v_s.float()).type_as(win_v_s)
             out[i, unmask_ind_i] = y_s
 
         # re-assemble all head outputs side by side

@@ -107,12 +107,25 @@ def main(args):
         video_tensor = video_tensor.half()
         mask_tensor = mask_tensor.half()
 
-    # 5. Inference
+    # 5. Prepare dummy flows and masks for model forward
+    # The model expects: masked_frames, completed_flows, masks_in, masks_updated, num_local_frames
+    b, t, c, h, w = video_tensor.shape
+    # Create dummy flows (forward and backward) with zeros
+    dummy_flow = torch.zeros(b, t-1, 2, h, w, device=device)
+    completed_flows = (dummy_flow, dummy_flow)
+    
+    # Masks: mask_tensor is [1, T, 1, H, W] already
+    masks_in = mask_tensor
+    masks_updated = mask_tensor  # same as input for simplicity
+    
+    num_local_frames = t
+    
+    # 6. Inference
     print("⚡ Running Inference (ProPainter)...")
     with torch.no_grad():
         try:
-            # Main inference call
-            pred_tensor = model(video_tensor, mask_tensor)
+            # Main inference call with correct arguments
+            pred_tensor = model(video_tensor, completed_flows, masks_in, masks_updated, num_local_frames)
         except RuntimeError as e:
             if "out of memory" in str(e):
                 print("❌ OOM Error! Suggestions: Reduce chunk size or use ROI cropping in the main service.")

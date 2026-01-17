@@ -165,13 +165,14 @@ def run_pipeline(args):
     fwd_flow = fwd_flow.to(device)
     bwd_flow = bwd_flow.to(device)
 
-    # Inference
-    log(f"Inference (CPU, Local={LOCAL_FRAMES})...")
-    # Trim flows to LOCAL_FRAMES-1 (model expects flows for local frames only)
-    fwd_trim = fwd_flow[:, :LOCAL_FRAMES-1]
-    bwd_trim = bwd_flow[:, :LOCAL_FRAMES-1]
+    # Use all frames as local window
+    local_frames = original_length
+    log(f"Inference (CPU, Local={local_frames})...")
+    # Trim flows to local_frames-1 (model expects flows for local frames only)
+    fwd_trim = fwd_flow[:, :local_frames-1]
+    bwd_trim = bwd_flow[:, :local_frames-1]
     with torch.no_grad():
-        pred = model(frames_tensor, (fwd_trim, bwd_trim), masks_tensor, masks_tensor, LOCAL_FRAMES)[0]
+        pred = model(frames_tensor, (fwd_trim, bwd_trim), masks_tensor, masks_tensor, local_frames)[0]
 
     # Save
     log(f"Saving...")

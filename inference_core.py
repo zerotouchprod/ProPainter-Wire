@@ -107,7 +107,7 @@ def compute_flow_opencv(frames, downscale_factor=0.5):
 
 def run_pipeline(args):
     log("Starting...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")  # Force CPU for debugging
 
     f_files = sorted(
         [os.path.join(args.video, f) for f in os.listdir(args.video) if f.endswith(('.jpg', '.png', '.jpeg'))])

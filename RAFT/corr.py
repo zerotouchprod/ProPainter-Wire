@@ -21,10 +21,10 @@ class CorrBlock:
         corr = CorrBlock.corr(fmap1, fmap2)
 
         batch, h1, w1, dim, h2, w2 = corr.shape
-        corr = corr.reshape(batch*h1*w1, dim, h2, w2)
+        corr = corr.reshape(batch * h1 * w1, dim, h2, w2)
 
         self.corr_pyramid.append(corr)
-        for i in range(self.num_levels-1):
+        for i in range(self.num_levels - 1):
             corr = F.avg_pool2d(corr, 2, stride=2)
             self.corr_pyramid.append(corr)
 
@@ -36,12 +36,12 @@ class CorrBlock:
         out_pyramid = []
         for i in range(self.num_levels):
             corr = self.corr_pyramid[i]
-            dx = torch.linspace(-r, r, 2*r+1)
-            dy = torch.linspace(-r, r, 2*r+1)
+            dx = torch.linspace(-r, r, 2 * r + 1)
+            dy = torch.linspace(-r, r, 2 * r + 1)
             delta = torch.stack(torch.meshgrid(dy, dx), axis=-1).to(coords.device)
 
-            centroid_lvl = coords.reshape(batch*h1*w1, 1, 1, 2) / 2**i
-            delta_lvl = delta.view(1, 2*r+1, 2*r+1, 2)
+            centroid_lvl = coords.reshape(batch * h1 * w1, 1, 1, 2) / 2 ** i
+            delta_lvl = delta.view(1, 2 * r + 1, 2 * r + 1, 2)
             coords_lvl = centroid_lvl + delta_lvl
 
             corr = bilinear_sampler(corr, coords_lvl)
@@ -54,15 +54,16 @@ class CorrBlock:
     @staticmethod
     def corr(fmap1, fmap2):
         batch, dim, ht, wd = fmap1.shape
-        fmap1 = fmap1.view(batch, dim, ht*wd)
-        fmap2 = fmap2.view(batch, dim, ht*wd)
+        fmap1 = fmap1.view(batch, dim, ht * wd)
+        fmap2 = fmap2.view(batch, dim, ht * wd)
 
-        # --- FIX: SAFE FP32 MATMUL ---
-        # Prevents CUBLAS errors on RTX 30/40 series
-        f1 = fmap1.transpose(1,2).float().contiguous()
+        # --- SAFE MODE MATMUL ---
+        # Explicitly enforce FP32 and Contiguous Memory
+        # This fixes CUBLAS errors on CUDA 12+
+        f1 = fmap1.transpose(1, 2).float().contiguous()
         f2 = fmap2.float().contiguous()
+
         corr = torch.matmul(f1, f2)
-        
         corr = corr.view(batch, ht, wd, 1, ht, wd)
         return corr / torch.sqrt(torch.tensor(dim).float())
 

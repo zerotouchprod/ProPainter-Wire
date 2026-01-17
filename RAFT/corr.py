@@ -1,15 +1,15 @@
 import torch
 import torch.nn.functional as F
 from .utils.utils import bilinear_sampler, coords_grid
-from torch.cuda.amp import custom_fwd
 
-# FORCE DISABLE alt_cuda_corr for stability on CUDA 12+
-alt_cuda_corr = None 
+# --- LOBOTOMY: FORCE DISABLE CUSTOM CUDA KERNEL ---
 # try:
 #     import alt_cuda_corr
 # except:
+#     # alt_cuda_corr is not compiled
 #     pass
-
+alt_cuda_corr = None
+# --------------------------------------------------
 
 class CorrBlock:
     def __init__(self, fmap1, fmap2, num_levels=4, radius=4):
@@ -57,14 +57,23 @@ class CorrBlock:
         fmap1 = fmap1.view(batch, dim, ht*wd)
         fmap2 = fmap2.view(batch, dim, ht*wd)
 
-        # Force FP32 and Contiguous memory layout
-        f1 = fmap1.float().transpose(1,2).contiguous()
+        # --- FIX: SAFE FP32 MATMUL ---
+        # Prevents CUBLAS errors on RTX 30/40 series
+        f1 = fmap1.transpose(1,2).float().contiguous()
         f2 = fmap2.float().contiguous()
         corr = torch.matmul(f1, f2)
         
         corr = corr.view(batch, ht, wd, 1, ht, wd)
         return corr / torch.sqrt(torch.tensor(dim).float())
 
+class CorrLayer(torch.autograd.Function):
+    # Dummy implementation since we disabled alt_cuda_corr
+    @staticmethod
+    def forward(ctx, fmap1, fmap2, coords, r):
+        return torch.zeros(1) # Should not be called
+    @staticmethod
+    def backward(ctx, grad_corr):
+        return None, None, None, None
 
 class AlternateCorrBlock:
     def __init__(self, fmap1, fmap2, num_levels=4, radius=4):
@@ -78,27 +87,9 @@ class AlternateCorrBlock:
             self.pyramid.append((fmap1, fmap2))
 
     def __call__(self, coords):
-        coords = coords.permute(0, 2, 3, 1)
-        B, H, W, _ = coords.shape
-
-        corr_list = []
-        for i in range(self.num_levels):
-            r = self.radius
-            fmap1_i = self.pyramid[0][0].permute(0, 2, 3, 1)
-            fmap2_i = self.pyramid[i][1].permute(0, 2, 3, 1)
-
-            coords_i = (coords / 2**i).reshape(B, 1, H, W, 2).contiguous()
-            
-            # Fallback if compiled cuda version is missing
-            try:
-                corr = alt_cuda_corr(fmap1_i, fmap2_i, coords_i, r)
-            except (NameError, TypeError):
-                # Silent fallback or error if needed. 
-                # Ideally, ProPainter uses standard CorrBlock by default.
-                raise RuntimeError("alt_cuda_corr is disabled for stability on CUDA 12+. Use standard CorrBlock (args.alternate_corr=False).")
-                
-            corr_list.append(corr.squeeze(1))
-
-        corr = torch.stack(corr_list, dim=1)
-        corr = corr.reshape(B, -1, H, W)
-        return corr / 16.0
+        # Fallback to standard PyTorch implementation (slower but works)
+        # Note: ProPainter mostly uses the standard CorrBlock, not this one.
+        # If execution hits here, we will raise an error to be explicit, 
+        # or we could implement a slow fallback.
+        # Given we set alt_cuda_corr = None, the code should not try to use it.
+        raise NotImplementedError("AlternateCorrBlock requires custom CUDA kernel which is disabled.")

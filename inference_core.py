@@ -11,7 +11,7 @@ from PIL import Image
 # --- CONFIG ---
 MAX_WIDTH = 1280  # Защита от OOM
 MIN_FRAMES = 12  # ЖЕСТКИЙ СТАНДАРТ: Всегда добиваем до 12 кадров
-LOCAL_FRAMES = 12  # Используем все кадры как локальные (после padding)
+LOCAL_FRAMES = 5  # Стандартное окно (безопасно для длины 12)
 
 # --- SETUP ---
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'

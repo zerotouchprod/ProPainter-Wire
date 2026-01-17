@@ -12,13 +12,13 @@ from PIL import Image
 # Используем FP32, поэтому разрешение должно быть скромным
 SAFE_SHORT_SIDE = 640   
 MIN_FRAMES = 8          
-LOCAL_FRAMES = 1        # Безопасное окно
+LOCAL_FRAMES = 5        # Стандартное окно
 
 # --- SETUP ---
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-# FP32 настройки
-torch.backends.cuda.matmul.allow_tf32 = False 
-torch.backends.cudnn.allow_tf32 = False
+# Включим TF32 для стабильности
+torch.backends.cuda.matmul.allow_tf32 = True 
+torch.backends.cudnn.allow_tf32 = True
 
 warnings.filterwarnings("ignore")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))

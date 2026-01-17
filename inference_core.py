@@ -565,9 +565,8 @@ def main(args):
         logger.log("INFO", f"Using chunked processing for {T} frames", "🔀")
         comp_frames_tensor = process_video_in_chunks(
             video_tensor, mask_tensor, model, 
-            (fix_raft, fix_flow_complete),
-            args=args,
-            logger=logger
+            fix_raft, fix_flow_complete,
+            args, logger
         )
     else:
         logger.log("INFO", f"Processing all {T} frames at once", "🔀")

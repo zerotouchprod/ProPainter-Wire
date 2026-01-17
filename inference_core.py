@@ -173,25 +173,74 @@ def safe_raft_inference(
             # Reshape back: [B*T, C, H_small, W_small] -> [B, T, C, H_small, W_small]
             video_small = video_small.view(b, t, c, h_small, w_small)
             
-            # Run RAFT on downscaled video with additional error handling
+            # Run RAFT on downscaled video with comprehensive error handling
             try:
+                # Validate input tensor before RAFT
+                logger.log("DEBUG", f"RAFT input shape: {video_small.shape}, dtype: {video_small.dtype}", "🔍")
+                
+                # Ensure tensor is in correct format for RAFT
+                if video_small.dtype != torch.float32:
+                    logger.log("WARNING", f"Converting RAFT input from {video_small.dtype} to float32", "⚠️")
+                    video_small = video_small.float()
+                
+                # Check for NaN/Inf values
+                if torch.isnan(video_small).any() or torch.isinf(video_small).any():
+                    logger.log("ERROR", "RAFT input contains NaN or Inf values", "❌")
+                    raise ValueError("Input tensor contains invalid values")
+                
                 with torch.no_grad():
                     flows_small = raft_model(video_small, iters=raft_iter)
+                
+                logger.log("DEBUG", f"RAFT output shapes: {[f.shape for f in flows_small]}", "✅")
+                
             except Exception as raft_error:
                 logger.log("ERROR", f"RAFT model forward failed: {raft_error}", "❌")
-                # Check if it's a CUDA error
-                if "CUDA" in str(raft_error) or "cuda" in str(raft_error).lower():
+                
+                # Detailed error analysis
+                error_str = str(raft_error).lower()
+                if "cuda" in error_str or "cuda" in error_str:
                     logger.log("WARNING", "CUDA error detected in RAFT forward", "⚠️")
-                    # Try to clear cache and retry once
-                    torch.cuda.empty_cache()
-                    try:
-                        with torch.no_grad():
-                            flows_small = raft_model(video_small, iters=raft_iter)
-                        logger.log("INFO", "RAFT retry successful after cache clear", "✅")
-                    except Exception as retry_error:
-                        logger.log("ERROR", f"RAFT retry also failed: {retry_error}", "❌")
-                        raise RuntimeError(f"RAFT forward failed even after retry: {retry_error}")
+                    
+                    # Try multiple recovery strategies
+                    recovery_strategies = [
+                        ("Clearing cache and retrying", lambda: torch.cuda.empty_cache()),
+                        ("Reducing scale factor further", lambda: max(0.125, scale_factor * 0.25)),
+                        ("Using CPU fallback", lambda: "cpu_fallback")
+                    ]
+                    
+                    for strategy_name, strategy in recovery_strategies:
+                        logger.log("DEBUG", f"Trying recovery: {strategy_name}", "🔄")
+                        
+                        try:
+                            if strategy_name == "Clearing cache and retrying":
+                                torch.cuda.empty_cache()
+                                with torch.no_grad():
+                                    flows_small = raft_model(video_small, iters=raft_iter)
+                                logger.log("INFO", "RAFT retry successful after cache clear", "✅")
+                                break
+                                
+                            elif strategy_name == "Reducing scale factor further":
+                                smaller_scale = max(0.125, scale_factor * 0.25)
+                                logger.log("DEBUG", f"Trying smaller scale: {smaller_scale}x", "📉")
+                                # Recursive call with smaller scale
+                                return safe_raft_inference(
+                                    video_tensor, raft_model, smaller_scale, 
+                                    raft_iter, logger, enable_cpu_fallback
+                                )
+                                
+                            elif strategy_name == "Using CPU fallback" and enable_cpu_fallback:
+                                raise RuntimeError("Trigger CPU fallback")
+                                
+                        except Exception as recovery_error:
+                            logger.log("DEBUG", f"Recovery '{strategy_name}' failed: {recovery_error}", "⚠️")
+                            continue
+                    
+                    # If all recoveries failed
+                    logger.log("ERROR", "All RAFT recovery strategies failed", "❌")
+                    raise RuntimeError(f"RAFT forward failed after all recovery attempts: {raft_error}")
+                    
                 else:
+                    # Not a CUDA error
                     raise RuntimeError(f"RAFT forward failed: {raft_error}")
             
             # Upscale flows back to original size

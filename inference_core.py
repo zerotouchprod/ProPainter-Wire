@@ -11,7 +11,7 @@ from PIL import Image
 # --- CONFIG ---
 SAFE_SHORT_SIDE = 640   # Безопасное разрешение (640p)
 MIN_FRAMES = 8          # Минимальный блок
-LOCAL_FRAMES = 1        # МИНИМАЛЬНОЕ ОКНО (Fixes CUBLAS Error)
+LOCAL_FRAMES = 2        # Минимальное окно (l_t-1 = 1)
 
 # --- SETUP ---
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -165,10 +165,13 @@ def run_pipeline(args):
     # Inference
     log(f"Inference (Local={LOCAL_FRAMES})...")
     torch.cuda.empty_cache()
+    # Trim flows to LOCAL_FRAMES-1 (model expects flows for local frames only)
+    fwd_trim = fwd_gpu[:, :LOCAL_FRAMES-1]
+    bwd_trim = bwd_gpu[:, :LOCAL_FRAMES-1]
     # Flash attention might crash, keep it safe
     with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
         with torch.no_grad():
-            pred = model(frames_gpu, (fwd_gpu, bwd_gpu), masks_gpu, masks_gpu, LOCAL_FRAMES)[0]
+            pred = model(frames_gpu, (fwd_trim, bwd_trim), masks_gpu, masks_gpu, LOCAL_FRAMES)[0]
 
     # Save
     log(f"Saving...")

@@ -9,9 +9,9 @@ import re
 from PIL import Image
 
 # --- CONFIG ---
-MAX_WIDTH = 1280  # Защита памяти
-MIN_FRAMES = 8  # Минимальная длина для стабильной работы модели
-LOCAL_FRAMES = 1  # Минимальное окно внимания (не 0 и не 2)
+MAX_WIDTH = 1280  # Защита от OOM
+MIN_FRAMES = 12  # ЖЕСТКИЙ СТАНДАРТ: Всегда добиваем до 12 кадров
+LOCAL_FRAMES = 5  # Стандартное окно (безопасно для длины 12)
 
 # --- SETUP ---
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -28,6 +28,8 @@ def log(msg):
 
 
 def smart_imread(img_path, grayscale=False):
+    """ Robust Image Reader """
+
     def try_load(path):
         if not os.path.exists(path): return None
         try:
@@ -41,7 +43,6 @@ def smart_imread(img_path, grayscale=False):
     img = try_load(img_path)
     if img is not None: return img
 
-    # Fallback
     dir_name = os.path.dirname(img_path)
     file_name = os.path.basename(img_path)
     folder_type = os.path.basename(dir_name)
@@ -69,7 +70,6 @@ def smart_imread(img_path, grayscale=False):
 
 
 def generate_fallback_mask(h, w):
-    # log("   Generating synthetic mask")
     mask = np.zeros((h, w), dtype=np.uint8)
     x, y = int(0.05 * w), int(0.5 * h)
     mw, mh = int(0.9 * w), int(0.3 * h)
@@ -152,45 +152,43 @@ def run_pipeline(args):
         msk_pad = pad_img_to_modulo((msk > 127).astype(np.uint8) * 255, 16)
         mask_list.append((torch.from_numpy(msk_pad).float() / 255.0 > 0.5).float().unsqueeze(0))
 
-    # --- PADDING ---
+    # --- AGGRESSIVE PADDING ---
     original_length = len(video_list)
     if original_length < MIN_FRAMES:
         pad_needed = MIN_FRAMES - original_length
-        log(f"Padding input: {original_length} -> {MIN_FRAMES} frames")
-        # Pad beginning and end for better context
-        # If we need 5 more: add 2 at start, 3 at end?
-        # Simpler: just repeat last frame. ProPainter is robust to static frames.
+        log(f"Padding input: {original_length} -> {MIN_FRAMES} frames (Standard Block)")
         for _ in range(pad_needed):
             video_list.append(video_list[-1])
             mask_list.append(mask_list[-1])
 
-    # Convert padded lists to tensors
+    # Convert to Raw Flow
     raw_flow = [(t.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8) for t in video_list]
     frames_gpu = torch.stack(video_list).unsqueeze(0).to(device).half()
     masks_gpu = torch.stack(mask_list).unsqueeze(0).to(device).half()
 
     # Flow
+    log(f"Computing flow for {len(video_list)} frames...")
     fwd_cpu, bwd_cpu = compute_flow_opencv(raw_flow)
     fwd_gpu = fwd_cpu.to(device).half()
     bwd_gpu = bwd_cpu.to(device).half()
 
     # Inference
-    log("Inference...")
+    log(f"Inference with LOCAL_FRAMES={LOCAL_FRAMES}...")
     torch.cuda.empty_cache()
     with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
         with torch.no_grad():
-            # KEY: num_local_frames = LOCAL_FRAMES (1)
+            # (frames, flows, masks, masks_updated, num_local_frames)
             pred = model(frames_gpu, (fwd_gpu, bwd_gpu), masks_gpu, masks_gpu, LOCAL_FRAMES)[0]
 
     # Save
     log(f"Saving...")
     os.makedirs(args.output, exist_ok=True)
 
-    # Save only original frames
+    # Save ONLY original length
     for i in range(original_length):
         f_path = f_files[i]
 
-        # Output processing
+        # Result Processing
         p = pred[i].permute(1, 2, 0).float().cpu().numpy().clip(0, 1)
         p = p[:target_h, :target_w, :]  # Crop padding
         if (target_h, target_w) != (orig_h, orig_w):

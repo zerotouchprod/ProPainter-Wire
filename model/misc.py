@@ -53,8 +53,16 @@ def get_root_logger(logger_name='basicsr', log_level=logging.INFO, log_file=None
     return logger
 
 
-IS_HIGH_VERSION = [int(m) for m in list(re.findall(r"^([0-9]+)\.([0-9]+)\.([0-9]+)([^0-9][a-zA-Z0-9]*)?(\+git.*)?$",\
+# PATCHED by vastai_inerup: fix torch version parsing
+try:
+    IS_HIGH_VERSION = [int(m) for m in list(re.findall(r"^([0-9]+)\.([0-9]+)\.([0-9]+)([^0-9][a-zA-Z0-9]*)?(\+git.*)?$",\
     torch.__version__)[0][:3])] >= [1, 12, 0]
+except (IndexError, AttributeError, ValueError):
+    import torch
+    version_parts = torch.__version__.split('.')
+    IS_HIGH_VERSION = [int(version_parts[0]) if len(version_parts) > 0 else 1,
+                   int(version_parts[1].split('+')[0].split('a')[0].split('b')[0].split('rc')[0]) if len(version_parts) > 1 else 7,
+                   0]
 
 def gpu_is_available():
     if IS_HIGH_VERSION:

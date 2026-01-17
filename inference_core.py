@@ -15,8 +15,8 @@ LOCAL_FRAMES = 12  # Используем все кадры как локаль�
 
 # --- SETUP ---
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 warnings.filterwarnings("ignore")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -107,7 +107,7 @@ def compute_flow_opencv(frames, downscale_factor=0.5):
 
 def run_pipeline(args):
     log("Starting...")
-    device = torch.device("cpu")  # Force CPU for debugging
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     f_files = sorted(
         [os.path.join(args.video, f) for f in os.listdir(args.video) if f.endswith(('.jpg', '.png', '.jpeg'))])
